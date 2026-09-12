@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'screens/driver/driver_home_screen.dart';
+
 void main() {
   runApp(const VitEvBuggyApp());
 }
@@ -12,10 +14,8 @@ class VitEvBuggyApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'VIT EV BUGGY',
-      home: Scaffold(
-        appBar: AppBar(title: const Text('VIT EV BUGGY')),
-        body: const Center(child: Text('Driver Module')),
-      ),
+      theme: ThemeData(useMaterial3: true, fontFamily: 'Roboto'),
+      home: const DriverHomeScreen(),
     );
   }
 }
