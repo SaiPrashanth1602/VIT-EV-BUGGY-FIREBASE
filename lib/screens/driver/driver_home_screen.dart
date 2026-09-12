@@ -22,12 +22,12 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   bool _isProcessing = false;
 
   // Temporary pilot value.
-  // In production this will come from the backend
-  // using the authenticated driver's ID.
-  final String _vehicleId = 'EV1';
+  // Final backend integration will identify the driver
+  // and allocate one of EV1-EV4 as the active tracking slot.
+  String? _activeVehicleId;
 
   // Temporary pilot value.
-  // In production this will come from the logged-in driver.
+  // Final app will obtain the driver's identity from authentication.
   final String _driverName = 'Driver';
 
   @override
@@ -61,7 +61,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       _isProcessing = true;
     });
 
-    final started = await _locationService.startTracking(vehicleId: _vehicleId);
+    final started = await _locationService.startTracking();
 
     if (!mounted) {
       return;
@@ -70,10 +70,15 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     setState(() {
       _isProcessing = false;
       _shiftActive = started;
+      _activeVehicleId = started ? _locationService.vehicleId : null;
     });
 
     if (!started) {
       _showMessage('Location permission or GPS service is unavailable.');
+    } else {
+      _showMessage(
+        'Shift started. ${_activeVehicleId ?? 'EV'} tracking is active.',
+      );
     }
   }
 
@@ -95,6 +100,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     setState(() {
       _isProcessing = false;
       _shiftActive = false;
+      _activeVehicleId = null;
     });
 
     _showMessage('Shift ended successfully.');
@@ -334,7 +340,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                 const SizedBox(width: 12),
                 const Expanded(
                   child: Text(
-                    'Assigned Vehicle',
+                    'Active Tracking ID',
                     style: TextStyle(
                       color: Color(0xFF52636F),
                       fontSize: 13,
@@ -343,7 +349,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                   ),
                 ),
                 Text(
-                  _vehicleId,
+                  _activeVehicleId ?? 'EV',
                   style: const TextStyle(
                     color: Color(0xFF183B56),
                     fontSize: 16,
@@ -375,7 +381,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
           child: _buildInfoCard(
             Icons.sync_rounded,
             'Updates',
-            _shiftActive ? 'Live' : 'Waiting',
+            _shiftActive ? 'Every 4 sec' : 'Waiting',
           ),
         ),
       ],
