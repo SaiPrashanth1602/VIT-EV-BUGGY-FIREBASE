@@ -1,23 +1,5 @@
 import 'package:latlong2/latlong.dart';
 
-class EvSimulationState {
-  const EvSimulationState({
-    required this.vehicleId,
-    required this.position,
-    required this.isMoving,
-    required this.currentPickup,
-    required this.nextPickup,
-    required this.stopRemainingSeconds,
-  });
-
-  final String vehicleId;
-  final LatLng position;
-  final bool isMoving;
-  final String? currentPickup;
-  final String nextPickup;
-  final int stopRemainingSeconds;
-}
-
 class CampusStop {
   const CampusStop({
     required this.name,
@@ -31,12 +13,6 @@ class CampusStop {
 }
 
 class EvTrackingService {
-  static const String vehicleId = 'EV1';
-
-  static const double simulationSpeedMetersPerSecond = 8.0;
-
-  static const int stopDurationSeconds = 10;
-
   static const double facultyEligibilityRadiusMeters = 100.0;
 
   static const double evTriggerRadiusMeters = 35.0;
@@ -177,76 +153,8 @@ class EvTrackingService {
 
   final Distance _distance = const Distance();
 
-  List<LatLng> buildSimulationRoute() {
-    final route = <LatLng>[];
-
-    final pickupRoadIndices = campusStops
-        .map((stop) => _nearestRoadIndex(stop.pickupPosition))
-        .toList();
-
-    for (int i = 0; i < campusStops.length; i++) {
-      final currentIndex = pickupRoadIndices[i];
-
-      final nextIndex = i == campusStops.length - 1
-          ? pickupRoadIndices[0]
-          : pickupRoadIndices[i + 1];
-
-      route.add(campusStops[i].pickupPosition);
-
-      int index = currentIndex;
-
-      while (index != nextIndex) {
-        route.add(buggyRoad[index]);
-        index = (index + 1) % buggyRoad.length;
-      }
-
-      route.add(
-        campusStops[i == campusStops.length - 1 ? 0 : i + 1].pickupPosition,
-      );
-    }
-
-    return _removeDuplicatePoints(route);
-  }
-
-  int _nearestRoadIndex(LatLng point) {
-    int nearestIndex = 0;
-    double nearestDistance = double.infinity;
-
-    for (int i = 0; i < buggyRoad.length; i++) {
-      final distance = _distance.as(LengthUnit.Meter, point, buggyRoad[i]);
-
-      if (distance < nearestDistance) {
-        nearestDistance = distance;
-        nearestIndex = i;
-      }
-    }
-
-    return nearestIndex;
-  }
-
-  List<LatLng> _removeDuplicatePoints(List<LatLng> points) {
-    final result = <LatLng>[];
-
-    for (final point in points) {
-      if (result.isEmpty || result.last != point) {
-        result.add(point);
-      }
-    }
-
-    return result;
-  }
-
   double distanceBetween(LatLng first, LatLng second) {
     return _distance.as(LengthUnit.Meter, first, second);
-  }
-
-  LatLng interpolate(LatLng start, LatLng end, double progress) {
-    final clampedProgress = progress.clamp(0.0, 1.0);
-
-    return LatLng(
-      start.latitude + (end.latitude - start.latitude) * clampedProgress,
-      start.longitude + (end.longitude - start.longitude) * clampedProgress,
-    );
   }
 
   CampusStop? findFacultyBlock(LatLng facultyPosition) {

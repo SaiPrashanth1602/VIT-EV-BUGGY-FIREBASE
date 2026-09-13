@@ -3,29 +3,32 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../../services/ev_location_provider.dart';
-import '../../services/ev_api_provider.dart';
+import '../../services/ev_simulation_provider.dart';
 import '../../services/ev_tracking_service.dart';
-import '../../services/faculty_location_service.dart';
 import '../../services/notification_service.dart';
-import 'faculty_simulation_screen.dart';
 
-class FacultyHomeScreen extends StatefulWidget {
-  const FacultyHomeScreen({super.key});
+class FacultySimulationScreen extends StatefulWidget {
+  const FacultySimulationScreen({super.key});
 
   @override
-  State<FacultyHomeScreen> createState() => _FacultyHomeScreenState();
+  State<FacultySimulationScreen> createState() =>
+      _FacultySimulationScreenState();
 }
 
-class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
+class _FacultySimulationScreenState extends State<FacultySimulationScreen> {
   static const Color vitBlue = Color(0xFF123C69);
   static const Color vitGreen = Color(0xFF18864B);
   static const Color routeYellow = Color(0xFFFFD600);
 
   static const LatLng vitChennai = LatLng(12.8406, 80.1534);
+
+  // TEMPORARY SIMULATION FACULTY LOCATION.
+  // Remove this simulation screen and this value
+  // when the pilot is handed over to SDC.
+  static const LatLng facultySimulationPosition = LatLng(12.84435, 80.15518);
 
   static const LatLng ab1 = LatLng(12.84391293192312, 80.15342317676296);
 
@@ -39,24 +42,15 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
 
   final MapController _mapController = MapController();
 
-  final FacultyLocationService _facultyLocationService =
-      FacultyLocationService();
-
-  late final EvLocationProvider _evProvider;
+  late final EvSimulationProvider _evProvider;
 
   StreamSubscription<EvLocation>? _evLocationSubscription;
 
-  StreamSubscription<Position>? _facultyLocationSubscription;
-
-  LatLng? _evPosition;
-
-  LatLng? _facultyPosition;
+  LatLng _evPosition = EvTrackingService.adbPickup;
 
   bool _evIsMoving = false;
 
-  bool _evLocationAvailable = false;
-
-  bool _facultyLocationAvailable = false;
+  String? _evWaitingBlock;
 
   String? _notificationMessage;
 
@@ -64,80 +58,25 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
 
   CampusStop? _facultyBlock;
 
-  String? _evWaitingBlock;
-
   @override
   void initState() {
     super.initState();
 
-    _evProvider = EvApiProvider();
+    _evProvider = EvSimulationProvider(trackingService: EvTrackingService());
+
+    _facultyBlock = EvTrackingService().findFacultyBlock(
+      facultySimulationPosition,
+    );
 
     _evLocationSubscription = _evProvider.locationStream.listen(
       _handleEvLocation,
     );
 
     _evProvider.start();
-
-    _startFacultyLocation();
-  }
-
-  Future<void> _startFacultyLocation() async {
-    final started = await _facultyLocationService.startTracking();
-
-    if (!started) {
-      if (mounted) {
-        setState(() {
-          _facultyLocationAvailable = false;
-        });
-      }
-
-      return;
-    }
-
-    if (mounted) {
-      setState(() {
-        _facultyLocationAvailable = true;
-      });
-    }
-
-    final initialPosition = await _facultyLocationService.getCurrentPosition();
-
-    if (initialPosition != null) {
-      _updateFacultyPosition(initialPosition, moveMap: true);
-    }
-
-    _facultyLocationSubscription = _facultyLocationService.locationStream
-        .listen(_updateFacultyPosition);
-  }
-
-  void _updateFacultyPosition(Position position, {bool moveMap = false}) {
-    if (!mounted) {
-      return;
-    }
-
-    final newPosition = LatLng(position.latitude, position.longitude);
-
-    final newFacultyBlock = EvTrackingService().findFacultyBlock(newPosition);
-
-    setState(() {
-      _facultyPosition = newPosition;
-      _facultyBlock = newFacultyBlock;
-      _facultyLocationAvailable = true;
-    });
-
-    if (moveMap) {
-      _mapController.move(newPosition, 17.0);
-    }
-
-    _checkFacultyNotification();
   }
 
   @override
   void dispose() {
-    _facultyLocationSubscription?.cancel();
-
-    _facultyLocationService.dispose();
-
     _evLocationSubscription?.cancel();
 
     _evProvider.stop();
@@ -153,6 +92,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     }
 
     final evPosition = location.position;
+
     final isMoving = location.speed > 0;
 
     String? waitingBlock;
@@ -164,7 +104,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     setState(() {
       _evPosition = evPosition;
       _evIsMoving = isMoving;
-      _evLocationAvailable = true;
       _evWaitingBlock = waitingBlock;
     });
 
@@ -175,22 +114,23 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     final trackingService = EvTrackingService();
 
     CampusStop? nearestStop;
+
     double nearestDistance = double.infinity;
 
     for (final stop in EvTrackingService.campusStops) {
-      final blockDistance = trackingService.distanceBetween(
-        evPosition,
-        stop.blockPosition,
-      );
-
       final pickupDistance = trackingService.distanceBetween(
         evPosition,
         stop.pickupPosition,
       );
 
-      final distance = blockDistance < pickupDistance
-          ? blockDistance
-          : pickupDistance;
+      final blockDistance = trackingService.distanceBetween(
+        evPosition,
+        stop.blockPosition,
+      );
+
+      final distance = pickupDistance < blockDistance
+          ? pickupDistance
+          : blockDistance;
 
       if (distance < nearestDistance) {
         nearestDistance = distance;
@@ -208,26 +148,13 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
 
   void _checkFacultyNotification() {
     final facultyBlock = _facultyBlock;
-    final evPosition = _evPosition;
 
-    if (facultyBlock == null || evPosition == null) {
-      if (_notificationMessage != null) {
-        setState(() {
-          _notificationMessage = null;
-        });
-      }
-
-      if (_evInsideFacultyBlock) {
-        _evInsideFacultyBlock = false;
-
-        NotificationService.instance.cancelEvArrival();
-      }
-
+    if (facultyBlock == null) {
       return;
     }
 
     final isNearBlock = EvTrackingService().isEvNearStop(
-      evPosition,
+      _evPosition,
       facultyBlock,
     );
 
@@ -235,7 +162,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
       _evInsideFacultyBlock = true;
 
       final message =
-          '${_evVehicleName()} is arriving at '
+          'EV1 is arriving at '
           '${facultyBlock.name}';
 
       setState(() {
@@ -256,19 +183,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     }
   }
 
-  String _evVehicleName() {
-    return 'EV';
-  }
-
-  void _openSimulation() {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const FacultySimulationScreen()));
-  }
-
   @override
   Widget build(BuildContext context) {
-    final facultyBlockName = _facultyBlock?.name ?? 'Not assigned';
+    final facultyBlockName = _facultyBlock?.name ?? 'Unknown';
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -276,10 +193,35 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
         backgroundColor: vitBlue,
         foregroundColor: Colors.white,
         elevation: 0,
+        leading: IconButton(
+          onPressed: () {
+            Navigator.of(context).pop();
+          },
+          icon: const Icon(Icons.arrow_back_rounded),
+        ),
         title: const Text(
-          'VIT EV BUGGY',
+          'EV SIMULATION',
           style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: 0.4),
         ),
+        actions: [
+          Container(
+            margin: const EdgeInsets.only(right: 14, top: 13, bottom: 13),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: const Text(
+              'DEMO',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.7,
+              ),
+            ),
+          ),
+        ],
       ),
       body: Stack(
         children: [
@@ -311,14 +253,18 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
               MarkerLayer(
                 markers: [
                   _buildPickupMarker(EvTrackingService.adbPickup),
+
                   _buildPickupMarker(EvTrackingService.ab2Pickup),
+
                   _buildPickupMarker(EvTrackingService.ab4Pickup),
+
                   _buildPickupMarker(EvTrackingService.ab3Pickup),
+
                   _buildPickupMarker(EvTrackingService.ab1Pickup),
 
-                  if (_facultyPosition != null) _buildFacultyMarker(),
+                  _buildFacultyMarker(),
 
-                  if (_evPosition != null) _buildVehicleMarker(),
+                  _buildVehicleMarker(),
 
                   _buildCampusMarker(position: ab1, label: 'AB1'),
 
@@ -334,25 +280,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
             ],
           ),
 
-          Positioned(left: 16, top: 16, child: _buildPickupLegend()),
+          Positioned(left: 16, top: 16, child: _buildSimulationBadge()),
 
-          Positioned(right: 68, top: 16, child: _buildSimulationButton()),
+          Positioned(left: 16, top: 60, child: _buildPickupLegend()),
 
           Positioned(right: 16, top: 16, child: _buildMapControl()),
-
-          if (!_facultyLocationAvailable)
-            Positioned(
-              left: 16,
-              right: 16,
-              top: 70,
-              child: _buildLocationWarning(),
-            ),
 
           if (_notificationMessage != null)
             Positioned(
               left: 16,
               right: 16,
-              top: _facultyLocationAvailable ? 70 : 140,
+              top: 70,
               child: _buildNotificationBanner(),
             ),
 
@@ -360,50 +298,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
             left: 16,
             right: 16,
             bottom: 20,
-            child: _buildPilotCard(facultyBlockName),
+            child: _buildSimulationCard(facultyBlockName),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildSimulationButton() {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: _openSimulation,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.96),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: vitGreen.withValues(alpha: 0.35)),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.18),
-                blurRadius: 10,
-                offset: const Offset(0, 3),
-              ),
-            ],
-          ),
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.play_circle_fill_rounded, color: vitGreen, size: 20),
-              SizedBox(width: 7),
-              Text(
-                'SIMULATE EV',
-                style: TextStyle(
-                  color: vitBlue,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.4,
-                ),
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
@@ -503,9 +400,42 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     );
   }
 
+  Widget _buildSimulationBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.orange[800],
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.20),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.science_rounded, color: Colors.white, size: 14),
+          SizedBox(width: 6),
+          Text(
+            'SIMULATION MODE',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 10,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Marker _buildVehicleMarker() {
     return Marker(
-      point: _evPosition!,
+      point: _evPosition,
       width: 82,
       height: 82,
       child: AnimatedScale(
@@ -549,7 +479,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
                 ],
               ),
               child: const Text(
-                'EV',
+                'EV1',
                 style: TextStyle(
                   color: vitBlue,
                   fontSize: 11,
@@ -565,7 +495,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
 
   Marker _buildFacultyMarker() {
     return Marker(
-      point: _facultyPosition!,
+      point: facultySimulationPosition,
       width: 90,
       height: 75,
       child: Column(
@@ -741,82 +671,15 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
     );
   }
 
-  Widget _buildLocationWarning() {
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.96),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.15),
-              blurRadius: 15,
-              offset: const Offset(0, 5),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: Colors.orange.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(
-                Icons.location_off_rounded,
-                color: Colors.orange[800],
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 11),
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'LOCATION REQUIRED',
-                    style: TextStyle(
-                      color: vitBlue,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.4,
-                    ),
-                  ),
-                  SizedBox(height: 3),
-                  Text(
-                    'Enable location permission '
-                    'to track your position.',
-                    style: TextStyle(
-                      color: Colors.grey,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget _buildSimulationCard(String facultyBlockName) {
+    final String statusText;
 
-  Widget _buildPilotCard(String facultyBlockName) {
-    final String evStatus;
-
-    if (!_evLocationAvailable) {
-      evStatus = 'Waiting for EV location';
-    } else if (_evIsMoving) {
-      evStatus = 'EV is moving';
+    if (_evIsMoving) {
+      statusText = 'EV1 is moving';
     } else if (_evWaitingBlock != null) {
-      evStatus = 'EV is waiting at $_evWaitingBlock';
+      statusText = 'EV1 is waiting at $_evWaitingBlock';
     } else {
-      evStatus = 'EV is stopped';
+      statusText = 'EV1 is waiting';
     }
 
     return Container(
@@ -851,27 +714,23 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
                 ),
               ),
               const SizedBox(width: 13),
-              Expanded(
+              const Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'VIT EV BUGGY',
+                    Text(
+                      'EV1',
                       style: TextStyle(
                         color: vitBlue,
                         fontSize: 18,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    const SizedBox(height: 2),
+                    SizedBox(height: 2),
                     Text(
-                      _evLocationAvailable
-                          ? 'Live location'
-                          : 'EV location unavailable',
+                      'Simulated live location',
                       style: TextStyle(
-                        color: _evLocationAvailable
-                            ? Colors.grey
-                            : Colors.orange[800],
+                        color: Colors.grey,
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
                       ),
@@ -895,7 +754,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Waiting at: $facultyBlockName',
+                  'Waiting at: '
+                  '$facultyBlockName',
                   style: const TextStyle(
                     color: vitBlue,
                     fontSize: 14,
@@ -916,7 +776,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  evStatus,
+                  statusText,
                   style: const TextStyle(
                     color: vitBlue,
                     fontSize: 14,
@@ -932,25 +792,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
   }
 
   Widget _buildStatusBadge() {
-    if (!_evLocationAvailable) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: BoxDecoration(
-          color: Colors.orange.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Text(
-          'OFFLINE',
-          style: TextStyle(
-            color: Colors.orange[800],
-            fontSize: 10,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 0.4,
-          ),
-        ),
-      );
-    }
-
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
@@ -979,13 +820,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
       child: InkWell(
         borderRadius: BorderRadius.circular(14),
         onTap: () {
-          final facultyPosition = _facultyPosition;
-
-          if (facultyPosition != null) {
-            _mapController.move(facultyPosition, 17.0);
-          } else {
-            _mapController.move(vitChennai, 16.2);
-          }
+          _mapController.move(facultySimulationPosition, 17.0);
         },
         child: const Padding(
           padding: EdgeInsets.all(12),
