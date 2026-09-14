@@ -82,6 +82,85 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
   }
 
   Future<void> _startFacultyLocation() async {
+    final serviceEnabled = await _facultyLocationService
+        .isLocationServiceEnabled();
+
+    if (!serviceEnabled) {
+      if (mounted) {
+        setState(() {
+          _facultyLocationAvailable = false;
+        });
+
+        await _showLocationRequiredDialog(
+          title: 'Location services required',
+          message:
+              'VIT EV Buggy needs your device location to identify your nearby '
+              'campus block and provide EV arrival notifications when the buggy '
+              'approaches your pickup point.',
+          actionText: 'Open Settings',
+          onAction: () {
+            _facultyLocationService.openLocationSettings();
+          },
+        );
+      }
+
+      return;
+    }
+
+    final permission = await _facultyLocationService.getPermissionStatus();
+
+    if (permission == LocationPermission.denied) {
+      if (mounted) {
+        await _showLocationRequiredDialog(
+          title: 'Location access required',
+          message:
+              'VIT EV Buggy uses your location to identify your nearby campus '
+              'block and provide EV arrival notifications when the buggy '
+              'approaches your pickup point.\n\n'
+              'Location access is required for this feature to work correctly.',
+          actionText: 'Allow Location',
+          onAction: () async {
+            await _facultyLocationService.requestPermission();
+          },
+        );
+      }
+    }
+
+    final updatedPermission = await _facultyLocationService
+        .getPermissionStatus();
+
+    if (updatedPermission == LocationPermission.deniedForever) {
+      if (mounted) {
+        setState(() {
+          _facultyLocationAvailable = false;
+        });
+
+        await _showLocationRequiredDialog(
+          title: 'Location permission blocked',
+          message:
+              'Location access has been permanently denied for VIT EV Buggy. '
+              'Please enable location permission from your device settings '
+              'to use block detection and EV arrival notifications.',
+          actionText: 'Open Settings',
+          onAction: () {
+            _facultyLocationService.openAppSettings();
+          },
+        );
+      }
+
+      return;
+    }
+
+    if (updatedPermission == LocationPermission.denied) {
+      if (mounted) {
+        setState(() {
+          _facultyLocationAvailable = false;
+        });
+      }
+
+      return;
+    }
+
     final started = await _facultyLocationService.startTracking();
 
     if (!started) {
@@ -106,8 +185,84 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
       _updateFacultyPosition(initialPosition, moveMap: true);
     }
 
-    _facultyLocationSubscription = _facultyLocationService.locationStream
+    _facultyLocationSubscription ??= _facultyLocationService.locationStream
         .listen(_updateFacultyPosition);
+  }
+
+  Future<void> _showLocationRequiredDialog({
+    required String title,
+    required String message,
+    required String actionText,
+    required VoidCallback onAction,
+  }) async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          title: Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: vitGreen.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.location_on_rounded, color: vitGreen),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    color: vitBlue,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          content: Text(
+            message,
+            style: const TextStyle(
+              color: Colors.black87,
+              fontSize: 14,
+              height: 1.5,
+            ),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          actions: [
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  onAction();
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: vitGreen,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: Text(
+                  actionText,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   void _updateFacultyPosition(Position position, {bool moveMap = false}) {
@@ -789,8 +944,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
                   ),
                   SizedBox(height: 3),
                   Text(
-                    'Enable location permission '
-                    'to track your position.',
+                    'Location is needed for block detection '
+                    'and EV arrival alerts.',
                     style: TextStyle(
                       color: Colors.grey,
                       fontSize: 12,
@@ -798,6 +953,18 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
                     ),
                   ),
                 ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            TextButton(
+              onPressed: _startFacultyLocation,
+              child: const Text(
+                'ENABLE',
+                style: TextStyle(
+                  color: vitGreen,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
             ),
           ],

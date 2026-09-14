@@ -56,7 +56,6 @@ class EvTrackingService {
   static const List<String> pickupNames = ['ADB', 'AB2', 'AB4', 'AB3', 'AB1'];
 
   static const List<LatLng> buggyRoad = [
-    // Line 2
     LatLng(12.8441727, 80.1553903),
     LatLng(12.8445047, 80.1548582),
     LatLng(12.8445298, 80.1548324),
@@ -127,8 +126,6 @@ class EvTrackingService {
     LatLng(12.8423734, 80.1565494),
     LatLng(12.8425156, 80.1566209),
     LatLng(12.8427424, 80.1567364),
-
-    // Line 3
     LatLng(12.8429351, 80.1568321),
     LatLng(12.8430885, 80.1569036),
     LatLng(12.8432308, 80.1569608),

@@ -14,24 +14,16 @@ class FacultyLocationService {
 
   Stream<Position> get locationStream => _locationController.stream;
 
-  Future<bool> checkAndRequestPermission() async {
-    if (!await Geolocator.isLocationServiceEnabled()) {
-      return false;
-    }
+  Future<LocationPermission> getPermissionStatus() async {
+    return Geolocator.checkPermission();
+  }
 
-    LocationPermission permission = await Geolocator.checkPermission();
+  Future<bool> isLocationServiceEnabled() async {
+    return Geolocator.isLocationServiceEnabled();
+  }
 
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      return false;
-    }
-
-    return permission == LocationPermission.always ||
-        permission == LocationPermission.whileInUse;
+  Future<LocationPermission> requestPermission() async {
+    return Geolocator.requestPermission();
   }
 
   Future<bool> startTracking() async {
@@ -39,7 +31,19 @@ class FacultyLocationService {
       return true;
     }
 
-    if (!await checkAndRequestPermission()) {
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      return false;
+    }
+
+    final permission = await Geolocator.checkPermission();
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      return false;
+    }
+
+    if (permission != LocationPermission.always &&
+        permission != LocationPermission.whileInUse) {
       return false;
     }
 
@@ -81,13 +85,28 @@ class FacultyLocationService {
   }
 
   Future<Position?> getCurrentPosition() async {
-    if (!await checkAndRequestPermission()) {
+    final permission = await Geolocator.checkPermission();
+
+    if (permission != LocationPermission.always &&
+        permission != LocationPermission.whileInUse) {
+      return null;
+    }
+
+    if (!await Geolocator.isLocationServiceEnabled()) {
       return null;
     }
 
     return Geolocator.getCurrentPosition(
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
     );
+  }
+
+  Future<void> openLocationSettings() async {
+    await Geolocator.openLocationSettings();
+  }
+
+  Future<void> openAppSettings() async {
+    await Geolocator.openAppSettings();
   }
 
   Future<void> dispose() async {
