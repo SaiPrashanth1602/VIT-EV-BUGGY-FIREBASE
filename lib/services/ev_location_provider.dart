@@ -25,3 +25,19 @@ abstract class EvLocationProvider {
 
   Future<List<EvLocation>> fetchCurrentLocations();
 }
+
+class NoopEvLocationProvider implements EvLocationProvider {
+  const NoopEvLocationProvider();
+
+  @override
+  Stream<EvLocation> get locationStream => const Stream.empty();
+
+  @override
+  Future<void> start() async {}
+
+  @override
+  Future<void> stop() async {}
+
+  @override
+  Future<List<EvLocation>> fetchCurrentLocations() async => const [];
+}

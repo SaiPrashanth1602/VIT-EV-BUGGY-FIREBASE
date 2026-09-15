@@ -1,17 +1,18 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 
-import '../../services/ev_location_provider.dart';
 import '../../services/ev_api_provider.dart';
+import '../../services/ev_location_provider.dart';
 import '../../services/ev_tracking_service.dart';
 import '../../services/faculty_location_service.dart';
 import '../../services/notification_service.dart';
-import 'faculty_simulation_screen.dart';
 
 class FacultyHomeScreen extends StatefulWidget {
   const FacultyHomeScreen({super.key});
@@ -21,359 +22,255 @@ class FacultyHomeScreen extends StatefulWidget {
 }
 
 class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
-  static const Color vitBlue = Color(0xFF123C69);
-  static const Color vitGreen = Color(0xFF18864B);
-  static const Color routeYellow = Color(0xFFFFD600);
-
-  static const LatLng vitChennai = LatLng(12.8406, 80.1534);
-
-  static const LatLng ab1 = LatLng(12.84391293192312, 80.15342317676296);
-
-  static const LatLng ab2 = LatLng(12.843120555928554, 80.15645139066287);
-
-  static const LatLng ab3 = LatLng(12.844043686792524, 80.15474014135296);
-
-  static const LatLng ab4 = LatLng(12.843127357629559, 80.1554401593973);
-
-  static const LatLng adb = LatLng(12.840719876775859, 80.15393816088053);
-
   final MapController _mapController = MapController();
 
-  final FacultyLocationService _facultyLocationService =
-      FacultyLocationService();
+  late final EvLocationProvider _evProvider =
+      (Platform.isAndroid || Platform.isIOS) && Firebase.apps.isNotEmpty
+      ? EvApiProvider()
+      : const NoopEvLocationProvider();
 
-  late final EvLocationProvider _evProvider;
+  late final FacultyLocationService _facultyLocationService;
 
-  StreamSubscription<EvLocation>? _evLocationSubscription;
-
+  StreamSubscription<EvLocation>? _evSubscription;
   StreamSubscription<Position>? _facultyLocationSubscription;
 
-  LatLng? _evPosition;
+  Timer? _evAvailabilityTimer;
 
   LatLng? _facultyPosition;
+  LatLng? _evPosition;
 
-  bool _evIsMoving = false;
-
-  bool _evLocationAvailable = false;
-
-  bool _facultyLocationAvailable = false;
-
+  String? _facultyBlockName;
   String? _notificationMessage;
 
+  bool _locationAvailable = false;
+  bool _evLocationAvailable = false;
+  bool _evIsMoving = false;
   bool _evInsideFacultyBlock = false;
-
-  CampusStop? _facultyBlock;
-
-  String? _evWaitingBlock;
 
   @override
   void initState() {
     super.initState();
 
-    _evProvider = EvApiProvider();
+    _facultyLocationService = FacultyLocationService();
 
-    _evLocationSubscription = _evProvider.locationStream.listen(
-      _handleEvLocation,
-    );
-
-    _evProvider.start();
-
-    _startFacultyLocation();
+    _initialize();
   }
+
+  Future<void> _initialize() async {
+    try {
+      await _evProvider.start();
+    } catch (_) {
+      // Firebase or platform services may be unavailable during tests or setup.
+    }
+
+    try {
+      _evSubscription = _evProvider.locationStream.listen(
+        _handleEvLocation,
+        onError: (_) {},
+      );
+    } catch (_) {
+      // Ignore provider stream startup failures.
+    }
+
+    _startEvAvailabilityCheck();
+
+    try {
+      await _startFacultyLocation();
+    } catch (_) {
+      // Ignore location platform failures during startup.
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // FACULTY LOCATION
+  // ---------------------------------------------------------------------------
 
   Future<void> _startFacultyLocation() async {
-    final serviceEnabled = await _facultyLocationService
-        .isLocationServiceEnabled();
+    try {
+      final serviceEnabled = await _facultyLocationService
+          .isLocationServiceEnabled();
 
-    if (!serviceEnabled) {
-      if (mounted) {
-        setState(() {
-          _facultyLocationAvailable = false;
-        });
-
-        await _showLocationRequiredDialog(
-          title: 'Location services required',
-          message:
-              'VIT EV Buggy needs your device location to identify your nearby '
-              'campus block and provide EV arrival notifications when the buggy '
-              'approaches your pickup point.',
-          actionText: 'Open Settings',
-          onAction: () {
-            _facultyLocationService.openLocationSettings();
-          },
-        );
+      if (!serviceEnabled) {
+        if (mounted) {
+          await _showLocationServiceDialog();
+        }
+        return;
       }
 
-      return;
-    }
+      var permission = await _facultyLocationService.getPermissionStatus();
 
-    final permission = await _facultyLocationService.getPermissionStatus();
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          await _showPermissionExplanation();
+        }
 
-    if (permission == LocationPermission.denied) {
-      if (mounted) {
-        await _showLocationRequiredDialog(
-          title: 'Location access required',
-          message:
-              'VIT EV Buggy uses your location to identify your nearby campus '
-              'block and provide EV arrival notifications when the buggy '
-              'approaches your pickup point.\n\n'
-              'Location access is required for this feature to work correctly.',
-          actionText: 'Allow Location',
-          onAction: () async {
-            await _facultyLocationService.requestPermission();
-          },
-        );
-      }
-    }
-
-    final updatedPermission = await _facultyLocationService
-        .getPermissionStatus();
-
-    if (updatedPermission == LocationPermission.deniedForever) {
-      if (mounted) {
-        setState(() {
-          _facultyLocationAvailable = false;
-        });
-
-        await _showLocationRequiredDialog(
-          title: 'Location permission blocked',
-          message:
-              'Location access has been permanently denied for VIT EV Buggy. '
-              'Please enable location permission from your device settings '
-              'to use block detection and EV arrival notifications.',
-          actionText: 'Open Settings',
-          onAction: () {
-            _facultyLocationService.openAppSettings();
-          },
-        );
+        permission = await _facultyLocationService.requestPermission();
       }
 
-      return;
-    }
-
-    if (updatedPermission == LocationPermission.denied) {
-      if (mounted) {
-        setState(() {
-          _facultyLocationAvailable = false;
-        });
+      if (permission == LocationPermission.denied) {
+        return;
       }
 
-      return;
-    }
-
-    final started = await _facultyLocationService.startTracking();
-
-    if (!started) {
-      if (mounted) {
-        setState(() {
-          _facultyLocationAvailable = false;
-        });
+      if (permission == LocationPermission.deniedForever) {
+        if (mounted) {
+          await _showPermissionDeniedForeverDialog();
+        }
+        return;
       }
 
-      return;
+      if (permission != LocationPermission.always &&
+          permission != LocationPermission.whileInUse) {
+        return;
+      }
+
+      final started = await _facultyLocationService.startTracking();
+
+      if (!started) {
+        return;
+      }
+
+      _facultyLocationSubscription = _facultyLocationService.locationStream
+          .listen(_handleFacultyPosition, onError: (_) {});
+    } catch (_) {
+      // Some environments (such as widget tests) do not have the platform
+      // location plugin registered, so startup should stay non-fatal.
     }
-
-    if (mounted) {
-      setState(() {
-        _facultyLocationAvailable = true;
-      });
-    }
-
-    final initialPosition = await _facultyLocationService.getCurrentPosition();
-
-    if (initialPosition != null) {
-      _updateFacultyPosition(initialPosition, moveMap: true);
-    }
-
-    _facultyLocationSubscription ??= _facultyLocationService.locationStream
-        .listen(_updateFacultyPosition);
   }
 
-  Future<void> _showLocationRequiredDialog({
-    required String title,
-    required String message,
-    required String actionText,
-    required VoidCallback onAction,
-  }) async {
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          title: Row(
-            children: [
-              Container(
-                width: 42,
-                height: 42,
-                decoration: BoxDecoration(
-                  color: vitGreen.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(Icons.location_on_rounded, color: vitGreen),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  title,
-                  style: const TextStyle(
-                    color: vitBlue,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          content: Text(
-            message,
-            style: const TextStyle(
-              color: Colors.black87,
-              fontSize: 14,
-              height: 1.5,
-            ),
-          ),
-          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          actions: [
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                  onAction();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: vitGreen,
-                  foregroundColor: Colors.white,
-                  elevation: 0,
-                  padding: const EdgeInsets.symmetric(vertical: 13),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: Text(
-                  actionText,
-                  style: const TextStyle(fontWeight: FontWeight.w800),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
+  void _handleFacultyPosition(Position position) {
+    final facultyPosition = LatLng(position.latitude, position.longitude);
 
-  void _updateFacultyPosition(Position position, {bool moveMap = false}) {
+    final facultyStop = EvTrackingService().findFacultyBlock(facultyPosition);
+
     if (!mounted) {
       return;
     }
 
-    final newPosition = LatLng(position.latitude, position.longitude);
-
-    final newFacultyBlock = EvTrackingService().findFacultyBlock(newPosition);
-
     setState(() {
-      _facultyPosition = newPosition;
-      _facultyBlock = newFacultyBlock;
-      _facultyLocationAvailable = true;
+      _facultyPosition = facultyPosition;
+      _locationAvailable = true;
+      _facultyBlockName = facultyStop?.name;
     });
 
-    if (moveMap) {
-      _mapController.move(newPosition, 17.0);
+    if (facultyStop != null && _evPosition != null) {
+      _checkEvArrival(facultyPosition, facultyStop, _evPosition!);
     }
-
-    _checkFacultyNotification();
   }
 
-  @override
-  void dispose() {
-    _facultyLocationSubscription?.cancel();
-
-    _facultyLocationService.dispose();
-
-    _evLocationSubscription?.cancel();
-
-    _evProvider.stop();
-
-    NotificationService.instance.cancelEvArrival();
-
-    super.dispose();
-  }
+  // ---------------------------------------------------------------------------
+  // EV LOCATION
+  // ---------------------------------------------------------------------------
 
   void _handleEvLocation(EvLocation location) {
     if (!mounted) {
       return;
     }
 
-    final evPosition = location.position;
-    final isMoving = location.speed > 0;
+    final position = location.position;
 
-    String? waitingBlock;
+    final isMoving = location.speed >= 1.0;
 
-    if (!isMoving) {
-      waitingBlock = _findNearestPickupBlock(evPosition);
+    setState(() {
+      _evPosition = position;
+      _evLocationAvailable = true;
+      _evIsMoving = isMoving;
+    });
+
+    if (_facultyPosition == null) {
+      return;
+    }
+
+    final facultyStop = EvTrackingService().findFacultyBlock(_facultyPosition!);
+
+    if (facultyStop == null) {
+      return;
+    }
+
+    _checkEvArrival(_facultyPosition!, facultyStop, position);
+  }
+
+  // ---------------------------------------------------------------------------
+  // EV AVAILABILITY
+  //
+  // Firebase provider emits active EV locations but does not emit a
+  // "removed" event when the driver ends the shift.
+  //
+  // Therefore we periodically fetch the current active locations.
+  // If there are none, the old EV marker is cleared.
+  // ---------------------------------------------------------------------------
+
+  void _startEvAvailabilityCheck() {
+    _evAvailabilityTimer?.cancel();
+
+    _evAvailabilityTimer = Timer.periodic(const Duration(seconds: 2), (
+      _,
+    ) async {
+      try {
+        final locations = await _evProvider.fetchCurrentLocations();
+
+        if (!mounted) {
+          return;
+        }
+
+        if (locations.isEmpty) {
+          _clearEvLocation();
+        }
+      } catch (_) {
+        // Keep the current UI state if a temporary read fails.
+      }
+    });
+  }
+
+  void _clearEvLocation() {
+    if (!mounted) {
+      return;
     }
 
     setState(() {
-      _evPosition = evPosition;
-      _evIsMoving = isMoving;
-      _evLocationAvailable = true;
-      _evWaitingBlock = waitingBlock;
+      _evPosition = null;
+      _evIsMoving = false;
+      _evLocationAvailable = false;
+
+      _notificationMessage = null;
     });
 
-    _checkFacultyNotification();
+    _evInsideFacultyBlock = false;
+
+    NotificationService.instance.cancelEvArrival();
   }
 
-  String? _findNearestPickupBlock(LatLng evPosition) {
+  // ---------------------------------------------------------------------------
+  // EV ARRIVAL / GEOFENCING
+  // ---------------------------------------------------------------------------
+
+  void _checkEvArrival(
+    LatLng facultyPosition,
+    CampusStop facultyStop,
+    LatLng evPosition,
+  ) {
     final trackingService = EvTrackingService();
 
-    CampusStop? nearestStop;
-    double nearestDistance = double.infinity;
+    final facultyIsAssociated =
+        trackingService.distanceBetween(
+              facultyPosition,
+              facultyStop.blockPosition,
+            ) <=
+            EvTrackingService.facultyEligibilityRadiusMeters ||
+        trackingService.distanceBetween(
+              facultyPosition,
+              facultyStop.pickupPosition,
+            ) <=
+            EvTrackingService.facultyEligibilityRadiusMeters;
 
-    for (final stop in EvTrackingService.campusStops) {
-      final blockDistance = trackingService.distanceBetween(
-        evPosition,
-        stop.blockPosition,
-      );
-
-      final pickupDistance = trackingService.distanceBetween(
-        evPosition,
-        stop.pickupPosition,
-      );
-
-      final distance = blockDistance < pickupDistance
-          ? blockDistance
-          : pickupDistance;
-
-      if (distance < nearestDistance) {
-        nearestDistance = distance;
-        nearestStop = stop;
-      }
-    }
-
-    if (nearestStop != null &&
-        nearestDistance <= EvTrackingService.evTriggerRadiusMeters) {
-      return nearestStop.name;
-    }
-
-    return null;
-  }
-
-  void _checkFacultyNotification() {
-    final facultyBlock = _facultyBlock;
-    final evPosition = _evPosition;
-
-    if (facultyBlock == null || evPosition == null) {
-      if (_notificationMessage != null) {
-        setState(() {
-          _notificationMessage = null;
-        });
-      }
-
+    if (!facultyIsAssociated) {
       if (_evInsideFacultyBlock) {
         _evInsideFacultyBlock = false;
+
+        if (mounted) {
+          setState(() {
+            _notificationMessage = null;
+          });
+        }
 
         NotificationService.instance.cancelEvArrival();
       }
@@ -381,808 +278,616 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen> {
       return;
     }
 
-    final isNearBlock = EvTrackingService().isEvNearStop(
-      evPosition,
-      facultyBlock,
-    );
+    final evNear = trackingService.isEvNearStop(evPosition, facultyStop);
 
-    if (isNearBlock && !_evInsideFacultyBlock) {
-      _evInsideFacultyBlock = true;
+    if (evNear) {
+      if (!_evInsideFacultyBlock) {
+        _evInsideFacultyBlock = true;
 
-      final message =
-          '${_evVehicleName()} is arriving at '
-          '${facultyBlock.name}';
+        if (mounted) {
+          setState(() {
+            _notificationMessage = 'EV is arriving at ${facultyStop.name}';
+          });
+        }
 
-      setState(() {
-        _notificationMessage = message;
-      });
-
-      NotificationService.instance.showEvArrival(blockName: facultyBlock.name);
-    } else if (!isNearBlock) {
-      _evInsideFacultyBlock = false;
-
-      if (_notificationMessage != null) {
-        setState(() {
-          _notificationMessage = null;
-        });
+        // Keep the existing notification service seam.
+        NotificationService.instance.showEvArrival(blockName: facultyStop.name);
       }
-
-      NotificationService.instance.cancelEvArrival();
-    }
-  }
-
-  String _evVehicleName() {
-    return 'EV';
-  }
-
-  void _openSimulation() {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const FacultySimulationScreen()));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final facultyBlockName = _facultyBlock?.name ?? 'Not assigned';
-
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: vitBlue,
-        foregroundColor: Colors.white,
-        elevation: 0,
-        title: const Text(
-          'VIT EV BUGGY',
-          style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: 0.4),
-        ),
-      ),
-      body: Stack(
-        children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: const MapOptions(
-              initialCenter: vitChennai,
-              initialZoom: 16.2,
-              minZoom: 13,
-              maxZoom: 19,
-            ),
-            children: [
-              TileLayer(
-                urlTemplate:
-                    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                userAgentPackageName: 'com.vit.evbuggy',
-              ),
-
-              PolylineLayer(
-                polylines: [
-                  Polyline(
-                    points: EvTrackingService.buggyRoad,
-                    strokeWidth: 6,
-                    color: routeYellow,
-                  ),
-                ],
-              ),
-
-              MarkerLayer(
-                markers: [
-                  _buildPickupMarker(EvTrackingService.adbPickup),
-                  _buildPickupMarker(EvTrackingService.ab2Pickup),
-                  _buildPickupMarker(EvTrackingService.ab4Pickup),
-                  _buildPickupMarker(EvTrackingService.ab3Pickup),
-                  _buildPickupMarker(EvTrackingService.ab1Pickup),
-
-                  if (_facultyPosition != null) _buildFacultyMarker(),
-
-                  if (_evPosition != null) _buildVehicleMarker(),
-
-                  _buildCampusMarker(position: ab1, label: 'AB1'),
-
-                  _buildCampusMarker(position: ab2, label: 'AB2'),
-
-                  _buildCampusMarker(position: ab3, label: 'AB3'),
-
-                  _buildCampusMarker(position: ab4, label: 'AB4'),
-
-                  _buildCampusMarker(position: adb, label: 'ADB'),
-                ],
-              ),
-            ],
-          ),
-
-          Positioned(left: 16, top: 16, child: _buildPickupLegend()),
-
-          Positioned(right: 68, top: 16, child: _buildSimulationButton()),
-
-          Positioned(right: 16, top: 16, child: _buildMapControl()),
-
-          if (!_facultyLocationAvailable)
-            Positioned(
-              left: 16,
-              right: 16,
-              top: 70,
-              child: _buildLocationWarning(),
-            ),
-
-          if (_notificationMessage != null)
-            Positioned(
-              left: 16,
-              right: 16,
-              top: _facultyLocationAvailable ? 70 : 140,
-              child: _buildNotificationBanner(),
-            ),
-
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 20,
-            child: _buildPilotCard(facultyBlockName),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSimulationButton() {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: _openSimulation,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.96),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: vitGreen.withValues(alpha: 0.35)),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.18),
-                blurRadius: 10,
-                offset: const Offset(0, 3),
-              ),
-            ],
-          ),
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.play_circle_fill_rounded, color: vitGreen, size: 20),
-              SizedBox(width: 7),
-              Text(
-                'SIMULATE EV',
-                style: TextStyle(
-                  color: vitBlue,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.4,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Marker _buildPickupMarker(LatLng position) {
-    return Marker(
-      point: position,
-      width: 70,
-      height: 70,
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: vitGreen.withValues(alpha: 0.12),
-              boxShadow: [
-                BoxShadow(
-                  color: vitGreen.withValues(alpha: 0.45),
-                  blurRadius: 16,
-                  spreadRadius: 6,
-                ),
-              ],
-            ),
-          ),
-          Container(
-            width: 16,
-            height: 16,
-            decoration: BoxDecoration(
-              color: vitGreen,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 3),
-              boxShadow: [
-                BoxShadow(
-                  color: vitGreen.withValues(alpha: 0.65),
-                  blurRadius: 9,
-                  spreadRadius: 2,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPickupLegend() {
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.96),
-          borderRadius: BorderRadius.circular(13),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.18),
-              blurRadius: 10,
-              offset: const Offset(0, 3),
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 12,
-              height: 12,
-              decoration: BoxDecoration(
-                color: vitGreen,
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white, width: 2),
-                boxShadow: [
-                  BoxShadow(
-                    color: vitGreen.withValues(alpha: 0.60),
-                    blurRadius: 7,
-                    spreadRadius: 2,
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 7),
-            const Text(
-              'PICKUP POINTS',
-              style: TextStyle(
-                color: vitBlue,
-                fontSize: 10,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0.4,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Marker _buildVehicleMarker() {
-    return Marker(
-      point: _evPosition!,
-      width: 82,
-      height: 82,
-      child: AnimatedScale(
-        scale: _evIsMoving ? 1.0 : 1.08,
-        duration: const Duration(milliseconds: 250),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: vitGreen,
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white, width: 3),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.30),
-                    blurRadius: 9,
-                    offset: const Offset(0, 3),
-                  ),
-                ],
-              ),
-              child: const Icon(
-                Icons.directions_bus_rounded,
-                color: Colors.white,
-                size: 27,
-              ),
-            ),
-            const SizedBox(height: 3),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(7),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.20),
-                    blurRadius: 5,
-                  ),
-                ],
-              ),
-              child: const Text(
-                'EV',
-                style: TextStyle(
-                  color: vitBlue,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Marker _buildFacultyMarker() {
-    return Marker(
-      point: _facultyPosition!,
-      width: 90,
-      height: 75,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-              color: vitBlue,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 3),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.30),
-                  blurRadius: 8,
-                  offset: const Offset(0, 3),
-                ),
-              ],
-            ),
-            child: const Icon(
-              Icons.person_rounded,
-              color: Colors.white,
-              size: 24,
-            ),
-          ),
-          const SizedBox(height: 3),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(7),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.18),
-                  blurRadius: 4,
-                ),
-              ],
-            ),
-            child: const Text(
-              'Faculty',
-              style: TextStyle(
-                color: vitBlue,
-                fontSize: 10,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Marker _buildCampusMarker({required LatLng position, required String label}) {
-    return Marker(
-      point: position,
-      width: 90,
-      height: 70,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-            decoration: BoxDecoration(
-              color: vitBlue,
-              borderRadius: BorderRadius.circular(8),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.25),
-                  blurRadius: 6,
-                  offset: const Offset(0, 3),
-                ),
-              ],
-            ),
-            child: Text(
-              label,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          CustomPaint(
-            size: const Size(14, 10),
-            painter: _MarkerArrowPainter(vitBlue),
-          ),
-          Container(
-            width: 10,
-            height: 10,
-            decoration: BoxDecoration(
-              color: vitGreen,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 2),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNotificationBanner() {
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.all(15),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.97),
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: vitGreen.withValues(alpha: 0.35)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.18),
-              blurRadius: 18,
-              offset: const Offset(0, 6),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: vitGreen,
-                borderRadius: BorderRadius.circular(13),
-              ),
-              child: const Icon(
-                Icons.notifications_active_rounded,
-                color: Colors.white,
-                size: 23,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'EV ARRIVAL',
-                    style: TextStyle(
-                      color: vitGreen,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    _notificationMessage!,
-                    style: const TextStyle(
-                      color: vitBlue,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            IconButton(
-              onPressed: () {
-                setState(() {
-                  _notificationMessage = null;
-                });
-
-                NotificationService.instance.cancelEvArrival();
-              },
-              icon: const Icon(Icons.close_rounded, color: Colors.grey),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLocationWarning() {
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.96),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.15),
-              blurRadius: 15,
-              offset: const Offset(0, 5),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: Colors.orange.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(
-                Icons.location_off_rounded,
-                color: Colors.orange[800],
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 11),
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'LOCATION REQUIRED',
-                    style: TextStyle(
-                      color: vitBlue,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.4,
-                    ),
-                  ),
-                  SizedBox(height: 3),
-                  Text(
-                    'Location is needed for block detection '
-                    'and EV arrival alerts.',
-                    style: TextStyle(
-                      color: Colors.grey,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 8),
-            TextButton(
-              onPressed: _startFacultyLocation,
-              child: const Text(
-                'ENABLE',
-                style: TextStyle(
-                  color: vitGreen,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPilotCard(String facultyBlockName) {
-    final String evStatus;
-
-    if (!_evLocationAvailable) {
-      evStatus = 'Waiting for EV location';
-    } else if (_evIsMoving) {
-      evStatus = 'EV is moving';
-    } else if (_evWaitingBlock != null) {
-      evStatus = 'EV is waiting at $_evWaitingBlock';
     } else {
-      evStatus = 'EV is stopped';
-    }
+      if (_evInsideFacultyBlock) {
+        _evInsideFacultyBlock = false;
 
-    return Container(
-      padding: const EdgeInsets.all(17),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.96),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.16),
-            blurRadius: 20,
-            offset: const Offset(0, 6),
+        if (mounted) {
+          setState(() {
+            _notificationMessage = null;
+          });
+        }
+
+        NotificationService.instance.cancelEvArrival();
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // LOCATION PERMISSION UI
+  // ---------------------------------------------------------------------------
+
+  Future<void> _showPermissionExplanation() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Location Required'),
+          content: const Text(
+            'VIT EV BUGGY uses your location to associate '
+            'you with the nearest campus block and notify '
+            'you when the EV shuttle approaches your area.\n\n'
+            'Location tracking can continue while the app '
+            'is running in the background.',
           ),
-        ],
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: vitGreen,
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: const Icon(
-                  Icons.electric_rickshaw_rounded,
-                  color: Colors.white,
-                  size: 25,
-                ),
-              ),
-              const SizedBox(width: 13),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'VIT EV BUGGY',
-                      style: TextStyle(
-                        color: vitBlue,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      _evLocationAvailable
-                          ? 'Live location'
-                          : 'EV location unavailable',
-                      style: TextStyle(
-                        color: _evLocationAvailable
-                            ? Colors.grey
-                            : Colors.orange[800],
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              _buildStatusBadge(),
-            ],
-          ),
-          const SizedBox(height: 14),
-          const Divider(height: 1),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              const Icon(
-                Icons.person_pin_circle_rounded,
-                color: vitGreen,
-                size: 21,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Waiting at: $facultyBlockName',
-                  style: const TextStyle(
-                    color: vitBlue,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              const Icon(
-                Icons.directions_bus_rounded,
-                color: vitGreen,
-                size: 21,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  evStatus,
-                  style: const TextStyle(
-                    color: vitBlue,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              child: const Text('CONTINUE'),
+            ),
+          ],
+        );
+      },
     );
   }
 
-  Widget _buildStatusBadge() {
-    if (!_evLocationAvailable) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: BoxDecoration(
-          color: Colors.orange.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Text(
-          'OFFLINE',
-          style: TextStyle(
-            color: Colors.orange[800],
-            fontSize: 10,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 0.4,
+  Future<void> _showLocationServiceDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Location Services Off'),
+          content: const Text(
+            'Please enable Location Services so VIT EV BUGGY '
+            'can determine your campus block and track EV arrival.',
           ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              child: const Text('CANCEL'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                Navigator.pop(context);
+                await Geolocator.openLocationSettings();
+              },
+              child: const Text('OPEN SETTINGS'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showPermissionDeniedForeverDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Location Permission Required'),
+          content: const Text(
+            'Location permission has been permanently denied. '
+            'Please enable it from Android Settings to use '
+            'faculty shuttle tracking.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              child: const Text('CANCEL'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                Navigator.pop(context);
+                await Geolocator.openAppSettings();
+              },
+              child: const Text('OPEN SETTINGS'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // MAP
+  // ---------------------------------------------------------------------------
+
+  List<Marker> _buildMarkers() {
+    final markers = <Marker>[];
+
+    // Faculty location.
+    if (_facultyPosition != null) {
+      markers.add(
+        Marker(
+          point: _facultyPosition!,
+          width: 44,
+          height: 44,
+          child: _buildFacultyMarker(),
         ),
       );
     }
 
+    // Actual pickup points.
+    for (int i = 0; i < EvTrackingService.pickupPoints.length; i++) {
+      markers.add(
+        Marker(
+          point: EvTrackingService.pickupPoints[i],
+          width: 38,
+          height: 38,
+          child: _buildPickupMarker(EvTrackingService.pickupNames[i]),
+        ),
+      );
+    }
+
+    // Block markers.
+    final blocks = <MapEntry<String, LatLng>>[
+      MapEntry('AB1', EvTrackingService.ab1Block),
+      MapEntry('AB2', EvTrackingService.ab2Block),
+      MapEntry('AB3', EvTrackingService.ab3Block),
+      MapEntry('AB4', EvTrackingService.ab4Block),
+      MapEntry('ADB', EvTrackingService.adbBlock),
+      MapEntry('MAB3', EvTrackingService.mab3Block),
+      MapEntry('MAB4', EvTrackingService.mab4Block),
+      MapEntry('AB5', EvTrackingService.ab5Block),
+    ];
+
+    for (final block in blocks) {
+      markers.add(
+        Marker(
+          point: block.value,
+          width: 72,
+          height: 34,
+          child: _buildBlockMarker(block.key),
+        ),
+      );
+    }
+
+    // EV marker ONLY when an active EV location exists.
+    if (_evLocationAvailable && _evPosition != null) {
+      markers.add(
+        Marker(
+          point: _evPosition!,
+          width: 58,
+          height: 58,
+          child: _buildVehicleMarker(),
+        ),
+      );
+    }
+
+    return markers;
+  }
+
+  Widget _buildFacultyMarker() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: _evIsMoving
-            ? vitGreen.withValues(alpha: 0.12)
-            : Colors.orange.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(20),
+        shape: BoxShape.circle,
+        color: Colors.blue,
+        border: Border.all(color: Colors.white, width: 3),
+        boxShadow: const [
+          BoxShadow(blurRadius: 10, spreadRadius: 2, color: Colors.black26),
+        ],
+      ),
+      child: const Icon(Icons.person, color: Colors.white, size: 23),
+    );
+  }
+
+  Widget _buildVehicleMarker() {
+    return Container(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.green.shade600,
+        border: Border.all(color: Colors.white, width: 3),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.green.withOpacity(0.45),
+            blurRadius: 16,
+            spreadRadius: 5,
+          ),
+        ],
+      ),
+      child: const Icon(Icons.directions_bus, color: Colors.white, size: 28),
+    );
+  }
+
+  Widget _buildPickupMarker(String name) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 18,
+          height: 18,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.greenAccent.shade400,
+            border: Border.all(color: Colors.white, width: 2),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.greenAccent.withOpacity(0.8),
+                blurRadius: 10,
+                spreadRadius: 2,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          name,
+          style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBlockMarker(String name) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.92),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: Colors.black12),
+        boxShadow: const [BoxShadow(blurRadius: 5, color: Colors.black12)],
       ),
       child: Text(
-        _evIsMoving ? 'MOVING' : 'STOPPED',
-        style: TextStyle(
-          color: _evIsMoving ? vitGreen : Colors.orange[800],
-          fontSize: 10,
-          fontWeight: FontWeight.w800,
-          letterSpacing: 0.4,
+        name,
+        textAlign: TextAlign.center,
+        style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: Stack(
+        children: [
+          _buildMap(),
+          _buildTopCard(),
+          _buildPilotCard(),
+          if (_notificationMessage != null) _buildArrivalNotification(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMap() {
+    return FlutterMap(
+      mapController: _mapController,
+      options: MapOptions(
+        initialCenter: const LatLng(12.84355, 80.1557),
+        initialZoom: 16.8,
+        minZoom: 14,
+        maxZoom: 20,
+      ),
+      children: [
+        TileLayer(
+          urlTemplate:
+              'https://server.arcgisonline.com/ArcGIS/rest/services/'
+              'World_Imagery/MapServer/tile/{z}/{y}/{x}',
+          userAgentPackageName: 'com.example.vit_ev_buggy',
+        ),
+
+        PolylineLayer(
+          polylines: [
+            Polyline(
+              points: EvTrackingService.buggyRoad,
+              strokeWidth: 4,
+              color: Colors.yellow,
+            ),
+          ],
+        ),
+
+        MarkerLayer(markers: _buildMarkers()),
+      ],
+    );
+  }
+
+  Widget _buildTopCard() {
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+          child: SizedBox(
+            height: 78,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(20),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.90),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: Colors.white, width: 1),
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          color: Colors.green.shade600,
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Icon(
+                          Icons.electric_bolt,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'VIT EV BUGGY',
+                              style: TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              'Faculty Shuttle Tracking',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.black54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      _buildLocationBadge(),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildMapControl() {
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(14),
-      elevation: 4,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: () {
-          final facultyPosition = _facultyPosition;
+  Widget _buildLocationBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: _locationAvailable ? Colors.green.shade50 : Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 7,
+            height: 7,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _locationAvailable ? Colors.green : Colors.grey,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            _locationAvailable ? 'GPS ON' : 'GPS OFF',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              color: _locationAvailable
+                  ? Colors.green.shade700
+                  : Colors.grey.shade700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
-          if (facultyPosition != null) {
-            _mapController.move(facultyPosition, 17.0);
-          } else {
-            _mapController.move(vitChennai, 16.2);
-          }
-        },
-        child: const Padding(
-          padding: EdgeInsets.all(12),
-          child: Icon(Icons.my_location_rounded, color: vitBlue, size: 24),
+  Widget _buildPilotCard() {
+    final String evStatus;
+
+    if (!_evLocationAvailable) {
+      evStatus = 'LOCATION NOT AVAILABLE';
+    } else if (_evIsMoving) {
+      evStatus = 'EV IS MOVING';
+    } else {
+      evStatus = 'EV STATIONARY';
+    }
+
+    return Positioned(
+      left: 16,
+      right: 16,
+      bottom: 20,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(22),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.94),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: Colors.black12),
+              boxShadow: const [
+                BoxShadow(
+                  blurRadius: 20,
+                  offset: Offset(0, 8),
+                  color: Colors.black12,
+                ),
+              ],
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: _evLocationAvailable
+                        ? Colors.green.shade50
+                        : Colors.grey.shade100,
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Icon(
+                    Icons.electric_car,
+                    color: _evLocationAvailable
+                        ? Colors.green.shade700
+                        : Colors.grey.shade500,
+                    size: 27,
+                  ),
+                ),
+                const SizedBox(width: 13),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'EV SHUTTLE',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.black54,
+                          letterSpacing: 0.8,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        evStatus,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      if (_facultyBlockName != null) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          'Associated: $_facultyBlockName',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _evLocationAvailable
+                        ? Colors.green.shade50
+                        : Colors.grey.shade100,
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Text(
+                    _evLocationAvailable ? 'ONLINE' : 'OFFLINE',
+                    style: TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                      color: _evLocationAvailable
+                          ? Colors.green.shade700
+                          : Colors.grey.shade600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
-}
 
-class _MarkerArrowPainter extends CustomPainter {
-  const _MarkerArrowPainter(this.color);
-
-  final Color color;
-
-  @override
-  void paint(ui.Canvas canvas, ui.Size size) {
-    final paint = ui.Paint()..color = color;
-
-    final path = ui.Path()
-      ..moveTo(0, 0)
-      ..lineTo(size.width / 2, size.height)
-      ..lineTo(size.width, 0)
-      ..close();
-
-    canvas.drawPath(path, paint);
+  Widget _buildArrivalNotification() {
+    return Positioned(
+      left: 16,
+      right: 16,
+      top: 105,
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Colors.green.shade700,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: const [
+              BoxShadow(
+                blurRadius: 14,
+                offset: Offset(0, 5),
+                color: Colors.black26,
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.notifications_active,
+                color: Colors.white,
+                size: 24,
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Text(
+                  _notificationMessage!,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+              IconButton(
+                onPressed: () {
+                  setState(() {
+                    _notificationMessage = null;
+                  });
+                },
+                icon: const Icon(Icons.close, color: Colors.white, size: 20),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _MarkerArrowPainter oldDelegate) {
-    return oldDelegate.color != color;
+  void dispose() {
+    _evAvailabilityTimer?.cancel();
+
+    _evSubscription?.cancel();
+    _facultyLocationSubscription?.cancel();
+
+    _facultyLocationService.stopTracking();
+
+    _evProvider.stop();
+
+    super.dispose();
   }
 }

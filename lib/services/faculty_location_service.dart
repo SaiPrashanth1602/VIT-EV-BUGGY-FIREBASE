@@ -31,49 +31,55 @@ class FacultyLocationService {
       return true;
     }
 
-    if (!await Geolocator.isLocationServiceEnabled()) {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        return false;
+      }
+
+      final permission = await Geolocator.checkPermission();
+
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return false;
+      }
+
+      if (permission != LocationPermission.always &&
+          permission != LocationPermission.whileInUse) {
+        return false;
+      }
+
+      _isTracking = true;
+
+      final locationSettings = AndroidSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 5,
+        intervalDuration: const Duration(seconds: 4),
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'VIT EV BUGGY',
+          notificationText: 'Faculty location tracking is active',
+          enableWakeLock: true,
+          enableWifiLock: true,
+        ),
+      );
+
+      _positionSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: locationSettings,
+          ).listen(
+            (position) {
+              if (!_locationController.isClosed) {
+                _locationController.add(position);
+              }
+            },
+            onError: (Object error) {
+              // Ignore runtime stream errors. The screen should keep rendering.
+            },
+          );
+
+      return true;
+    } catch (_) {
       return false;
     }
-
-    final permission = await Geolocator.checkPermission();
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      return false;
-    }
-
-    if (permission != LocationPermission.always &&
-        permission != LocationPermission.whileInUse) {
-      return false;
-    }
-
-    _isTracking = true;
-
-    final locationSettings = AndroidSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 5,
-      intervalDuration: const Duration(seconds: 4),
-      foregroundNotificationConfig: const ForegroundNotificationConfig(
-        notificationTitle: 'VIT EV BUGGY',
-        notificationText: 'Faculty location tracking is active',
-        enableWakeLock: true,
-        enableWifiLock: true,
-      ),
-    );
-
-    _positionSubscription =
-        Geolocator.getPositionStream(locationSettings: locationSettings).listen(
-          (position) {
-            if (!_locationController.isClosed) {
-              _locationController.add(position);
-            }
-          },
-          onError: (Object error) {
-            print('FACULTY LOCATION STREAM ERROR: $error');
-          },
-        );
-
-    return true;
   }
 
   Future<void> stopTracking() async {

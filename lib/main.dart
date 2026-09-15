@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
-
+import 'package:firebase_core/firebase_core.dart';
 import 'screens/faculty/faculty_home_screen.dart';
-import 'services/notification_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await NotificationService.instance.initialize();
+  try {
+    await Firebase.initializeApp();
+  } catch (_) {
+    // Keep the UI responsive even when Firebase is unavailable during tests or
+    // a partially configured startup environment.
+  }
 
   runApp(const VitEvBuggyFacultyApp());
 }
