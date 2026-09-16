@@ -13,16 +13,32 @@ class LocationService {
   DateTime? _lastMovementTime;
   Position? _lastPosition;
 
+  // Rolling buffer for accuracy-weighted smoothing, same approach used in
+  // the faculty app's FacultyLocationService. Prevents a single noisy GPS
+  // fix from making the EV marker jump or from being pushed to Firebase
+  // and shown wrong on every faculty device watching the stream.
+  final List<Position> _recentFixes = [];
+  static const int _smoothingWindow = 4;
+
   bool get isTracking => _isTracking;
   String? get vehicleId => _vehicleId;
 
   static const List<String> vehicleIds = ['EV1', 'EV2', 'EV3', 'EV4'];
 
-  static const Duration normalUpdateInterval = Duration(seconds: 4);
+  static const Duration normalUpdateInterval = Duration(seconds: 1);
 
   static const Duration stationaryTimeout = Duration(seconds: 120);
 
+  // Base minimum displacement required to count as real movement. Same
+  // value tuned for the faculty app; works for vehicle speed too since
+  // it's evaluated per fix, not per second.
   static const double movementThresholdMeters = 5.0;
+
+  // Reject only fixes the OS itself admits are badly broken (GPS
+  // cold-start spikes). Do NOT set this low — real phones routinely
+  // report 15-40m accuracy outdoors near buildings, and rejecting those
+  // would silently stop the EV from broadcasting its location at all.
+  static const double hardRejectAccuracyMeters = 80.0;
 
   final DatabaseReference _vehiclesReference = FirebaseDatabase.instance.ref(
     'evShuttle/vehicles',
@@ -82,11 +98,19 @@ class LocationService {
     _isStreaming = true;
     _lastMovementTime = DateTime.now();
     _lastPosition = null;
+    _recentFixes.clear();
 
     await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
 
     final locationSettings = AndroidSettings(
-      accuracy: LocationAccuracy.high,
+      // `best` requests the tightest GNSS fix tier available (same as
+      // `bestForNavigation` on Android — there is no separate tier).
+      accuracy: LocationAccuracy.best,
+      // OS-level distance filter left at 0 intentionally: the vehicle is
+      // always moving during a shift, and our own smoothing + movement
+      // gate below (in _handlePosition) does the real filtering. Setting
+      // this above 0 would also suppress the stationary-timeout fixes we
+      // need to detect that the EV has actually stopped.
       distanceFilter: 0,
       intervalDuration: normalUpdateInterval,
       foregroundNotificationConfig: const ForegroundNotificationConfig(
@@ -108,10 +132,24 @@ class LocationService {
     return true;
   }
 
-  void _handlePosition(Position position) {
+  void _handlePosition(Position rawPosition) {
     if (!_isTracking || _vehicleId == null) {
       return;
     }
+
+    // Drop only genuinely broken fixes (cold-start spikes). Everything
+    // else is used, weighted by quality, so the vehicle never goes
+    // "silent" on Firebase just because signal briefly got noisy.
+    if (rawPosition.accuracy > hardRejectAccuracyMeters) {
+      return;
+    }
+
+    _recentFixes.add(rawPosition);
+    if (_recentFixes.length > _smoothingWindow) {
+      _recentFixes.removeAt(0);
+    }
+
+    final position = _smoothedPosition(rawPosition);
 
     final now = DateTime.now();
 
@@ -125,7 +163,19 @@ class LocationService {
         position.longitude,
       );
 
-      hasMoved = distance >= movementThresholdMeters || position.speed >= 1.0;
+      // Adapt required displacement to fix quality, same logic as the
+      // faculty app: tighter fixes need less movement to be believed,
+      // noisy fixes need more, so jitter never reads as "moving."
+      final effectiveThreshold = movementThresholdMeters.clamp(
+        3.0,
+        position.accuracy.clamp(3.0, 15.0),
+      );
+
+      hasMoved = distance >= effectiveThreshold || position.speed >= 1.0;
+    } else {
+      // First-ever fix for this shift: treat as movement so the vehicle
+      // appears on the faculty map immediately.
+      hasMoved = true;
     }
 
     if (hasMoved) {
@@ -147,6 +197,43 @@ class LocationService {
     }
   }
 
+  /// Weighted average of recent fixes; tighter (lower-accuracy-number)
+  /// fixes count more. Smooths jitter before it ever reaches Firebase,
+  /// so every faculty device watching the stream sees the same clean
+  /// position instead of raw GPS noise.
+  Position _smoothedPosition(Position latest) {
+    if (_recentFixes.length == 1) {
+      return latest;
+    }
+
+    double weightSum = 0;
+    double latSum = 0;
+    double lngSum = 0;
+
+    for (final fix in _recentFixes) {
+      final effectiveAccuracy = fix.accuracy.clamp(3.0, 100.0);
+      final weight = 1 / (effectiveAccuracy * effectiveAccuracy);
+      weightSum += weight;
+      latSum += fix.latitude * weight;
+      lngSum += fix.longitude * weight;
+    }
+
+    return Position(
+      latitude: latSum / weightSum,
+      longitude: lngSum / weightSum,
+      timestamp: latest.timestamp,
+      accuracy: latest.accuracy,
+      altitude: latest.altitude,
+      altitudeAccuracy: latest.altitudeAccuracy,
+      heading: latest.heading,
+      headingAccuracy: latest.headingAccuracy,
+      speed: latest.speed,
+      speedAccuracy: latest.speedAccuracy,
+      floor: latest.floor,
+      isMocked: latest.isMocked,
+    );
+  }
+
   Future<void> stopTracking() async {
     if (!_isTracking) {
       return;
@@ -164,6 +251,7 @@ class LocationService {
     _vehicleId = null;
     _lastMovementTime = null;
     _lastPosition = null;
+    _recentFixes.clear();
 
     if (vehicleId != null) {
       await sendShiftEvent(vehicleId: vehicleId, status: 'ENDED');
