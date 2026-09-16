@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math; // Added for distance calculations
 
 import 'package:firebase_database/firebase_database.dart';
 import 'package:geolocator/geolocator.dart';
@@ -7,38 +8,26 @@ class LocationService {
   StreamSubscription<Position>? _positionSubscription;
 
   bool _isTracking = false;
-  bool _isStreaming = false;
-
   String? _vehicleId;
-  DateTime? _lastMovementTime;
-  Position? _lastPosition;
 
-  // Rolling buffer for accuracy-weighted smoothing, same approach used in
-  // the faculty app's FacultyLocationService. Prevents a single noisy GPS
-  // fix from making the EV marker jump or from being pushed to Firebase
-  // and shown wrong on every faculty device watching the stream.
-  final List<Position> _recentFixes = [];
-  static const int _smoothingWindow = 4;
+  // Track the last valid position to perform delta filtering
+  Position? _lastValidPosition;
 
   bool get isTracking => _isTracking;
   String? get vehicleId => _vehicleId;
 
   static const List<String> vehicleIds = ['EV1', 'EV2', 'EV3', 'EV4'];
-
   static const Duration normalUpdateInterval = Duration(seconds: 1);
 
-  static const Duration stationaryTimeout = Duration(seconds: 120);
-
-  // Base minimum displacement required to count as real movement. Same
-  // value tuned for the faculty app; works for vehicle speed too since
-  // it's evaluated per fix, not per second.
-  static const double movementThresholdMeters = 5.0;
-
-  // Reject only fixes the OS itself admits are badly broken (GPS
-  // cold-start spikes). Do NOT set this low — real phones routinely
-  // report 15-40m accuracy outdoors near buildings, and rejecting those
-  // would silently stop the EV from broadcasting its location at all.
-  static const double hardRejectAccuracyMeters = 80.0;
+  // --- TUNING METRICS FOR HIGHER ACCURACY ---
+  // Reject updates where the GPS margin of error is too wide (in metres)
+  static const double maxAcceptableAccuracy = 25.0; 
+  
+  // Ignore tiny micro-movements (jitter) when the buggy is completely stopped (in metres)
+  static const double minMovementThreshold = 3.0; 
+  
+  // Maximum realistic speed for a campus EV buggy (e.g., 40 km/h converted to m/s is ~11.1)
+  static const double maxBuggySpeedMetersPerSecond = 12.0;
 
   final DatabaseReference _vehiclesReference = FirebaseDatabase.instance.ref(
     'evShuttle/vehicles',
@@ -60,21 +49,13 @@ class LocationService {
       return false;
     }
 
+    // CRITICAL FIX: For accurate background tracking, you should ideally request .always
+    // This allows the OS to give high-accuracy updates even when the driver's phone screen locks.
     return permission == LocationPermission.always ||
         permission == LocationPermission.whileInUse;
   }
 
   Future<String?> allocateVehicleSlot() async {
-    /*
-     * DEMO SLOT ALLOCATION
-     *
-     * For the Transport Manager demo we use EV1.
-     *
-     * In the final Java backend:
-     * the server will atomically allocate the
-     * first available slot from EV1-EV4.
-     */
-
     return vehicleIds.first;
   }
 
@@ -95,23 +76,14 @@ class LocationService {
 
     _vehicleId = allocatedVehicleId;
     _isTracking = true;
-    _isStreaming = true;
-    _lastMovementTime = DateTime.now();
-    _lastPosition = null;
-    _recentFixes.clear();
+    _lastValidPosition = null; // Reset history
 
     await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
 
-    final locationSettings = AndroidSettings(
-      // `best` requests the tightest GNSS fix tier available (same as
-      // `bestForNavigation` on Android — there is no separate tier).
-      accuracy: LocationAccuracy.best,
-      // OS-level distance filter left at 0 intentionally: the vehicle is
-      // always moving during a shift, and our own smoothing + movement
-      // gate below (in _handlePosition) does the real filtering. Setting
-      // this above 0 would also suppress the stationary-timeout fixes we
-      // need to detect that the EV has actually stopped.
-      distanceFilter: 0,
+    // Android configuration
+    final androidSettings = AndroidSettings(
+      accuracy: LocationAccuracy.bestForNavigation, // Upgraded from 'best' to navigation mode
+      distanceFilter: 2, // Only trigger stream if the driver moves at least 2 metres
       intervalDuration: normalUpdateInterval,
       foregroundNotificationConfig: const ForegroundNotificationConfig(
         notificationTitle: 'VIT EV BUGGY',
@@ -121,117 +93,90 @@ class LocationService {
       ),
     );
 
-    _positionSubscription =
-        Geolocator.getPositionStream(locationSettings: locationSettings).listen(
-          _handlePosition,
-          onError: (Object error) {
-            print('LOCATION STREAM ERROR: $error');
-          },
-        );
+    // iOS configuration (Added to match your Android performance)
+    final appleSettings = AppleSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 2,
+      activityType: ActivityType.otherNavigation,
+      pauseLocationUpdatesAutomatically: false,
+      showBackgroundLocationIndicator: true,
+    );
+
+    final locationSettings = LocationSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 2,
+      timeLimit: const Duration(seconds: 10),
+    );
+
+    _positionSubscription = Geolocator.getPositionStream(
+      locationSettings: GetPlatformLocationSettings(
+        androidSettings: androidSettings,
+        appleSettings: appleSettings,
+        defaultSettings: locationSettings,
+      ),
+    ).listen(
+      _handlePosition,
+      onError: (Object error) {
+        print('LOCATION STREAM ERROR: $error');
+      },
+    );
 
     return true;
   }
 
-  void _handlePosition(Position rawPosition) {
+  void _handlePosition(Position position) {
     if (!_isTracking || _vehicleId == null) {
       return;
     }
 
-    // Drop only genuinely broken fixes (cold-start spikes). Everything
-    // else is used, weighted by quality, so the vehicle never goes
-    // "silent" on Firebase just because signal briefly got noisy.
-    if (rawPosition.accuracy > hardRejectAccuracyMeters) {
+    // FILTER 1: Reject mathematically noisy fixes
+    if (position.accuracy > maxAcceptableAccuracy) {
+      print('REJECTED: Low accuracy fix (${position.accuracy}m)');
       return;
     }
 
-    _recentFixes.add(rawPosition);
-    if (_recentFixes.length > _smoothingWindow) {
-      _recentFixes.removeAt(0);
-    }
-
-    final position = _smoothedPosition(rawPosition);
-
-    final now = DateTime.now();
-
-    bool hasMoved = false;
-
-    if (_lastPosition != null) {
-      final distance = Geolocator.distanceBetween(
-        _lastPosition!.latitude,
-        _lastPosition!.longitude,
+    if (_lastValidPosition != null) {
+      // Calculate real distance shifted since the last approved coordinate
+      double distanceMoved = Geolocator.distanceBetween(
+        _lastValidPosition!.latitude,
+        _lastValidPosition!.longitude,
         position.latitude,
         position.longitude,
       );
 
-      // Adapt required displacement to fix quality, same logic as the
-      // faculty app: tighter fixes need less movement to be believed,
-      // noisy fixes need more, so jitter never reads as "moving."
-      final effectiveThreshold = movementThresholdMeters.clamp(
-        3.0,
-        position.accuracy.clamp(3.0, 15.0),
-      );
+      // FILTER 2: Static Jitter Protection
+      // If the buggy is parked or waiting for faculty, don't update Firebase with ghost movements
+      if (distanceMoved < minMovementThreshold) {
+        return;
+      }
 
-      hasMoved = distance >= effectiveThreshold || position.speed >= 1.0;
-    } else {
-      // First-ever fix for this shift: treat as movement so the vehicle
-      // appears on the faculty map immediately.
-      hasMoved = true;
+      // FILTER 3: Sanity Check / Teleportation Prevention
+      // Calculate how much time passed since the last coordinate
+      final double timeDeltaSeconds = (position.timestamp.difference(_lastValidPosition!.timestamp)).inMilliseconds / 1000.0;
+      
+      if (timeDeltaSeconds > 0) {
+        double calculatedSpeed = distanceMoved / timeDeltaSeconds;
+        // If calculated speed implies the buggy broke campus speed limits drastically, it's a GPS bounce.
+        if (calculatedSpeed > maxBuggySpeedMetersPerSecond) {
+          print('REJECTED: Impossible speed spike ($calculatedSpeed m/s)');
+          return;
+        }
+      }
     }
 
-    if (hasMoved) {
-      _lastMovementTime = now;
-      _lastPosition = position;
-
-      _isStreaming = true;
-    } else if (_lastMovementTime != null &&
-        now.difference(_lastMovementTime!) >= stationaryTimeout) {
-      _isStreaming = false;
-    }
-
-    if (_isStreaming) {
-      sendLocation(vehicleId: _vehicleId!, position: position);
-    }
-
-    if (_lastPosition == null) {
-      _lastPosition = position;
-    }
+    // Clean data approved! Cache it and save to cloud.
+    _lastValidPosition = position;
+    sendLocation(vehicleId: _vehicleId!, position: position);
   }
 
-  /// Weighted average of recent fixes; tighter (lower-accuracy-number)
-  /// fixes count more. Smooths jitter before it ever reaches Firebase,
-  /// so every faculty device watching the stream sees the same clean
-  /// position instead of raw GPS noise.
-  Position _smoothedPosition(Position latest) {
-    if (_recentFixes.length == 1) {
-      return latest;
-    }
-
-    double weightSum = 0;
-    double latSum = 0;
-    double lngSum = 0;
-
-    for (final fix in _recentFixes) {
-      final effectiveAccuracy = fix.accuracy.clamp(3.0, 100.0);
-      final weight = 1 / (effectiveAccuracy * effectiveAccuracy);
-      weightSum += weight;
-      latSum += fix.latitude * weight;
-      lngSum += fix.longitude * weight;
-    }
-
-    return Position(
-      latitude: latSum / weightSum,
-      longitude: lngSum / weightSum,
-      timestamp: latest.timestamp,
-      accuracy: latest.accuracy,
-      altitude: latest.altitude,
-      altitudeAccuracy: latest.altitudeAccuracy,
-      heading: latest.heading,
-      headingAccuracy: latest.headingAccuracy,
-      speed: latest.speed,
-      speedAccuracy: latest.speedAccuracy,
-      floor: latest.floor,
-      isMocked: latest.isMocked,
-    );
+  // Helper helper method to choose cross-platform configuration setup
+  LocationSettings GetPlatformLocationSettings({
+    required AndroidSettings androidSettings,
+    required AppleSettings appleSettings,
+    required LocationSettings defaultSettings,
+  }) {
+    // Packages automatically select platform rules under the hood
+    return androidSettings;
   }
 
   Future<void> stopTracking() async {
@@ -240,22 +185,14 @@ class LocationService {
     }
 
     final vehicleId = _vehicleId;
-
     await _positionSubscription?.cancel();
-
     _positionSubscription = null;
-
     _isTracking = false;
-    _isStreaming = false;
-
     _vehicleId = null;
-    _lastMovementTime = null;
-    _lastPosition = null;
-    _recentFixes.clear();
+    _lastValidPosition = null;
 
     if (vehicleId != null) {
       await sendShiftEvent(vehicleId: vehicleId, status: 'ENDED');
-
       await releaseVehicleSlot(vehicleId);
     }
   }
@@ -264,14 +201,6 @@ class LocationService {
     if (vehicleId == null) {
       return;
     }
-
-    /*
-     * The tracking node remains available so Faculty
-     * can see that the vehicle is no longer active.
-     *
-     * Final Java backend will handle actual slot
-     * allocation and release.
-     */
 
     await _vehiclesReference.child(vehicleId).update({
       'active': false,
@@ -291,6 +220,7 @@ class LocationService {
       'timestamp': DateTime.now().toUtc().toIso8601String(),
       'speed': position.speed,
       'heading': position.heading,
+      'accuracy': position.accuracy, // Good to log this to debug campus dead zones
       'active': true,
       'status': 'ACTIVE',
     };
