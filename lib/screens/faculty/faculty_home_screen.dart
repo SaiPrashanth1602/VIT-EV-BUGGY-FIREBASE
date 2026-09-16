@@ -85,6 +85,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   String? _facultyBlockName;
   String? _notificationMessage;
 
+  // General "EV is at {block} pickup point" indicator — shows for EVERY
+  // faculty user regardless of their own assigned block, updates live to
+  // whichever block the EV currently sits near. Independent of the
+  // personal arrival notification below.
+  String? _evAtBlockName;
+
   bool _locationAvailable = false;
   bool _evLocationAvailable = false;
   bool _evIsMoving = false;
@@ -93,6 +99,19 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   late AnimationController _pulseController;
   late AnimationController _glowController;
+
+  // Named campus blocks, reused for both the map markers and the
+  // "EV at any block" pickup-point check below.
+  static final List<MapEntry<String, LatLng>> _campusBlocks = [
+    MapEntry('AB1', EvTrackingService.ab1Block),
+    MapEntry('AB2', EvTrackingService.ab2Block),
+    MapEntry('AB3', EvTrackingService.ab3Block),
+    MapEntry('AB4', EvTrackingService.ab4Block),
+    MapEntry('ADB', EvTrackingService.adbBlock),
+    MapEntry('MAB3', EvTrackingService.mab3Block),
+    MapEntry('MAB4', EvTrackingService.mab4Block),
+    MapEntry('AB5', EvTrackingService.ab5Block),
+  ];
 
   @override
   void initState() {
@@ -113,6 +132,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   Future<void> _initialize() async {
+    await NotificationService.instance.initialize();
+
     try {
       await _evProvider.start();
     } catch (_) {
@@ -151,6 +172,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return now.hour * 60 + now.minute;
   }
 
+  // Direction label is now blank for outbound trips ('TO CLASS' removed).
+  // 'RETURN' trips keep their label so the two directions stay distinct.
+  static const String _outboundDirectionLabel = '';
+
   _ScheduleEntry? _nextScheduledShuttle(String blockName) {
     final now = _currentMinutes();
     final candidates = <_ScheduleEntry>[];
@@ -162,12 +187,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     for (final time in ev1Outbound) {
       if (time >= now) {
-        candidates.add(_ScheduleEntry('EV1', time, 'TO CLASS'));
+        candidates.add(_ScheduleEntry('EV1', time, _outboundDirectionLabel));
       }
     }
     for (final time in ev2Outbound) {
       if (time >= now) {
-        candidates.add(_ScheduleEntry('EV2', time, 'TO CLASS'));
+        candidates.add(_ScheduleEntry('EV2', time, _outboundDirectionLabel));
       }
     }
     for (final time in ev1Return) {
@@ -187,12 +212,22 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
       if (tomorrowEv1 != null) {
         candidates.add(
-          _ScheduleEntry('EV1', tomorrowEv1, 'TO CLASS', tomorrow: true),
+          _ScheduleEntry(
+            'EV1',
+            tomorrowEv1,
+            _outboundDirectionLabel,
+            tomorrow: true,
+          ),
         );
       }
       if (tomorrowEv2 != null) {
         candidates.add(
-          _ScheduleEntry('EV2', tomorrowEv2, 'TO CLASS', tomorrow: true),
+          _ScheduleEntry(
+            'EV2',
+            tomorrowEv2,
+            _outboundDirectionLabel,
+            tomorrow: true,
+          ),
         );
       }
     }
@@ -219,8 +254,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       }
     }
 
-    addEntries('EV1', _ev1OutboundByBlock, 'TO CLASS');
-    addEntries('EV2', _ev2OutboundByBlock, 'TO CLASS');
+    addEntries('EV1', _ev1OutboundByBlock, _outboundDirectionLabel);
+    addEntries('EV2', _ev2OutboundByBlock, _outboundDirectionLabel);
     addEntries('EV1', _ev1ReturnByBlock, 'RETURN');
     addEntries('EV2', _ev2ReturnByBlock, 'RETURN');
 
@@ -369,6 +404,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _evIsMoving = isMoving;
     });
 
+    // Runs for every faculty user regardless of their own block.
+    _checkEvNearAnyBlock(position);
+
     if (_facultyPosition == null) return;
 
     final facultyStop = EvTrackingService().findFacultyBlock(_facultyPosition!);
@@ -400,7 +438,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         // Check timestamp of the latest vehicle location
         final latestLocation = locations.first;
         final now = DateTime.now().toUtc();
-        
+
         // If driver stopped sending coordinates for over 3 minutes
         if (now.difference(latestLocation.timestamp).inSeconds > 180) {
           _clearEvLocation();
@@ -419,6 +457,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _evIsMoving = false;
       _evLocationAvailable = false;
       _notificationMessage = null;
+      _evAtBlockName = null;
     });
 
     _evInsideFacultyBlock = false;
@@ -427,7 +466,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   // ---------------------------------------------------------------------------
-  // EV ARRIVAL / GEOFENCING
+  // EV ARRIVAL / GEOFENCING (personal — only for the viewer's own block)
   // ---------------------------------------------------------------------------
 
   void _checkEvArrival(
@@ -464,6 +503,32 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       }
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // EV AT ANY BLOCK — general pickup-point indicator (shown to ALL users)
+  // ---------------------------------------------------------------------------
+
+  void _checkEvNearAnyBlock(LatLng evPosition) {
+  final trackingService = EvTrackingService();
+
+  String? matchedBlockName;
+
+  for (final block in _campusBlocks) {
+    final stop = trackingService.findFacultyBlock(block.value);
+    if (stop == null) continue;
+
+    if (trackingService.isEvNearStop(evPosition, stop)) {
+      matchedBlockName = stop.name;
+      break;
+    }
+  }
+
+  if (matchedBlockName != _evAtBlockName && mounted) {
+    setState(() {
+      _evAtBlockName = matchedBlockName;
+    });
+  }
+}
 
   Future<void> _showLocationRequiredDialog({
     required String title,
@@ -665,14 +730,25 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 child: _buildLocationWarning(),
               ),
 
-            // ── Arrival Notification Banner ─────────────────────────────────
+            // ── EV At {Block} Pickup Point — shown to everyone, live ─────────
+            if (_evAtBlockName != null)
+              Positioned(
+                left: 16,
+                right: 16,
+                top: MediaQuery.of(context).padding.top + 78,
+                child: _buildEvAtBlockBanner(_evAtBlockName!),
+              ),
+
+            // ── Personal Arrival Notification Banner ─────────────────────────
             if (_notificationMessage != null)
               Positioned(
                 left: 16,
                 right: 16,
                 top:
                     MediaQuery.of(context).padding.top +
-                    (_locationAvailable ? 78 : 158),
+                    (_evAtBlockName != null
+                        ? 154
+                        : (_locationAvailable ? 78 : 158)),
                 child: _buildNotificationBanner(),
               ),
 
@@ -801,18 +877,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
 
     // Block markers
-    final blocks = <MapEntry<String, LatLng>>[
-      MapEntry('AB1', EvTrackingService.ab1Block),
-      MapEntry('AB2', EvTrackingService.ab2Block),
-      MapEntry('AB3', EvTrackingService.ab3Block),
-      MapEntry('AB4', EvTrackingService.ab4Block),
-      MapEntry('ADB', EvTrackingService.adbBlock),
-      MapEntry('MAB3', EvTrackingService.mab3Block),
-      MapEntry('MAB4', EvTrackingService.mab4Block),
-      MapEntry('AB5', EvTrackingService.ab5Block),
-    ];
-
-    for (final block in blocks) {
+    for (final block in _campusBlocks) {
       markers.add(
         _buildCampusMarker(
           position: block.value,
@@ -1092,6 +1157,52 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // BANNERS & WARNINGS
   // ---------------------------------------------------------------------------
 
+  Widget _buildEvAtBlockBanner(String blockName) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOutBack,
+      builder: (context, value, child) {
+        return Transform.scale(
+          scale: 0.95 + (0.05 * value),
+          child: Opacity(opacity: value.clamp(0.0, 1.0), child: child),
+        );
+      },
+      child: _buildGlassContainer(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        borderRadius: BorderRadius.circular(22),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: vitBlue.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.electric_rickshaw_rounded,
+                color: vitBlue,
+                size: 22,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'EV AT $blockName PICKUP POINT',
+                style: const TextStyle(
+                  color: vitBlue,
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.2,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildNotificationBanner() {
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),
@@ -1260,14 +1371,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final nextShuttle = _nextScheduledShuttle(facultyBlockName);
     final upcoming = _upcomingSchedule(facultyBlockName);
 
-    final String evStatus;
-    if (!_evLocationAvailable) {
-      evStatus = 'Waiting for live shuttle location';
-    } else if (_evIsMoving) {
-      evStatus = 'EV1 is moving';
-    } else {
-      evStatus = 'EV1 is stopped';
-    }
+    // No STOPPED state shown at all — either moving (shown as active/live)
+    // or offline. Standing still no longer surfaces a distinct label.
+    final String evStatus = !_evLocationAvailable
+        ? 'Waiting for live shuttle location'
+        : 'EV1 is online';
 
     return DraggableScrollableSheet(
       initialChildSize: 0.235,
@@ -1427,7 +1535,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                                 ),
                                 const SizedBox(height: 2),
                                 Text(
-                                  '${nextShuttle.tomorrow ? 'TOMORROW • ' : ''}${nextShuttle.direction} • ${_formatScheduleTime(nextShuttle.time)}',
+                                  nextShuttle.direction.isEmpty
+                                      ? '${nextShuttle.tomorrow ? 'TOMORROW • ' : ''}${_formatScheduleTime(nextShuttle.time)}'
+                                      : '${nextShuttle.tomorrow ? 'TOMORROW • ' : ''}${nextShuttle.direction} • ${_formatScheduleTime(nextShuttle.time)}',
                                   style: TextStyle(
                                     color: Colors.grey.shade600,
                                     fontSize: 12,
@@ -1485,49 +1595,79 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   Widget _buildScheduleRow(_ScheduleEntry entry) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 7),
-      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-      decoration: BoxDecoration(
-        color: Colors.grey.withValues(alpha: 0.045),
-        borderRadius: BorderRadius.circular(13),
-        border: Border.all(color: Colors.grey.withValues(alpha: 0.10)),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 52,
-            child: Text(
-              _formatScheduleTime(entry.time),
-              style: const TextStyle(
-                color: vitBlue,
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
+  final hasDirection = entry.direction.isNotEmpty;
+
+  return Container(
+    margin: const EdgeInsets.only(bottom: 7),
+    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+    decoration: BoxDecoration(
+      color: Colors.grey.withValues(alpha: 0.045),
+      borderRadius: BorderRadius.circular(13),
+      border: Border.all(color: Colors.grey.withValues(alpha: 0.10)),
+    ),
+    child: Row(
+      children: [
+        SizedBox(
+          width: 52,
+          child: Text(
+            _formatScheduleTime(entry.time),
+            style: const TextStyle(
+              color: vitBlue,
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+        Container(
+          width: 1,
+          height: 28,
+          color: Colors.grey.withValues(alpha: 0.18),
+        ),
+        const SizedBox(width: 11),
+        // When direction is blank, the vehicle chip takes over the row
+        // instead of leaving a spare Expanded column for a dash.
+        hasDirection
+            ? Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: vitGreen.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(7),
+                ),
+                child: Text(
+                  entry.vehicle,
+                  style: const TextStyle(
+                    color: vitGreen,
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              )
+            : Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: vitGreen.withValues(alpha: 0.10),
+                    borderRadius: BorderRadius.circular(7),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    entry.vehicle,
+                    style: const TextStyle(
+                      color: vitGreen,
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
               ),
-            ),
-          ),
-          Container(
-            width: 1,
-            height: 28,
-            color: Colors.grey.withValues(alpha: 0.18),
-          ),
-          const SizedBox(width: 11),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: vitGreen.withValues(alpha: 0.10),
-              borderRadius: BorderRadius.circular(7),
-            ),
-            child: Text(
-              entry.vehicle,
-              style: const TextStyle(
-                color: vitGreen,
-                fontSize: 10.5,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-          const SizedBox(width: 9),
+        if (hasDirection) const SizedBox(width: 9),
+        if (hasDirection)
           Expanded(
             child: Text(
               entry.direction,
@@ -1538,10 +1678,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ),
           ),
-        ],
-      ),
-    );
-  }
+      ],
+    ),
+  );
+}
+
 
   Widget _buildScheduleEmpty(String text) {
     return Container(
@@ -1599,6 +1740,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Status badge: only ONLINE or OFFLINE. No MOVING/STOPPED distinction.
   Widget _buildStatusBadge() {
     if (!_evLocationAvailable) {
       return _statusChip(
@@ -1609,11 +1751,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
 
     return _statusChip(
-      label: _evIsMoving ? 'MOVING' : 'STOPPED',
-      color: _evIsMoving ? vitGreen : Colors.orange.shade800,
-      bg: _evIsMoving
-          ? vitGreen.withValues(alpha: 0.12)
-          : Colors.orange.withValues(alpha: 0.12),
+      label: 'ONLINE',
+      color: vitGreen,
+      bg: vitGreen.withValues(alpha: 0.12),
     );
   }
 
