@@ -41,6 +41,8 @@ class EvApiProvider implements EvLocationProvider {
         return;
       }
 
+      bool foundActiveVehicle = false;
+
       for (final entry in data.entries) {
         final vehicleId = entry.key.toString();
         final vehicleData = entry.value;
@@ -50,13 +52,14 @@ class EvApiProvider implements EvLocationProvider {
         }
 
         final active = vehicleData['active'] == true;
+        final isOnline = vehicleData['isOnline'] ?? true;
 
-        if (!active) {
+        // Skip vehicle if shift has ended or driver is offline
+        if (!active || !isOnline) {
           continue;
         }
 
         final latitude = _toDouble(vehicleData['latitude']);
-
         final longitude = _toDouble(vehicleData['longitude']);
 
         if (latitude == null || longitude == null) {
@@ -64,9 +67,7 @@ class EvApiProvider implements EvLocationProvider {
         }
 
         final timestamp = _parseTimestamp(vehicleData['timestamp']);
-
         final speed = _toDouble(vehicleData['speed']) ?? 0.0;
-
         final heading = _toDouble(vehicleData['heading']) ?? 0.0;
 
         final location = EvLocation(
@@ -77,7 +78,13 @@ class EvApiProvider implements EvLocationProvider {
           heading: heading,
         );
 
+        foundActiveVehicle = true;
         _locationController.add(location);
+      }
+
+      // If no active vehicles are broadcasting, query current locations to clear state
+      if (!foundActiveVehicle) {
+        fetchCurrentLocations();
       }
     });
   }
@@ -102,12 +109,15 @@ class EvApiProvider implements EvLocationProvider {
         continue;
       }
 
-      if (vehicleData['active'] != true) {
+      final active = vehicleData['active'] == true;
+      final isOnline = vehicleData['isOnline'] ?? true;
+
+      // Filter out vehicles that have ended shift or disconnected
+      if (!active || !isOnline) {
         continue;
       }
 
       final latitude = _toDouble(vehicleData['latitude']);
-
       final longitude = _toDouble(vehicleData['longitude']);
 
       if (latitude == null || longitude == null) {
@@ -139,7 +149,6 @@ class EvApiProvider implements EvLocationProvider {
     _started = false;
 
     await _databaseSubscription?.cancel();
-
     _databaseSubscription = null;
   }
 
