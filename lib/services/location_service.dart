@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math' as math; // Added for distance calculations
+import 'dart:io' show Platform;
 
 import 'package:firebase_database/firebase_database.dart';
 import 'package:geolocator/geolocator.dart';
@@ -9,8 +9,6 @@ class LocationService {
 
   bool _isTracking = false;
   String? _vehicleId;
-
-  // Track the last valid position to perform delta filtering
   Position? _lastValidPosition;
 
   bool get isTracking => _isTracking;
@@ -19,14 +17,8 @@ class LocationService {
   static const List<String> vehicleIds = ['EV1', 'EV2', 'EV3', 'EV4'];
   static const Duration normalUpdateInterval = Duration(seconds: 1);
 
-  // --- TUNING METRICS FOR HIGHER ACCURACY ---
-  // Reject updates where the GPS margin of error is too wide (in metres)
-  static const double maxAcceptableAccuracy = 25.0; 
-  
-  // Ignore tiny micro-movements (jitter) when the buggy is completely stopped (in metres)
-  static const double minMovementThreshold = 3.0; 
-  
-  // Maximum realistic speed for a campus EV buggy (e.g., 40 km/h converted to m/s is ~11.1)
+  static const double maxAcceptableAccuracy = 25.0;
+  static const double minMovementThreshold = 3.0;
   static const double maxBuggySpeedMetersPerSecond = 12.0;
 
   final DatabaseReference _vehiclesReference = FirebaseDatabase.instance.ref(
@@ -35,6 +27,7 @@ class LocationService {
 
   Future<bool> checkAndRequestPermission() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
+      print('LOCATION SERVICE IS DISABLED');
       return false;
     }
 
@@ -46,117 +39,145 @@ class LocationService {
 
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
+      print('LOCATION PERMISSION DENIED: $permission');
       return false;
     }
 
-    // CRITICAL FIX: For accurate background tracking, you should ideally request .always
-    // This allows the OS to give high-accuracy updates even when the driver's phone screen locks.
     return permission == LocationPermission.always ||
         permission == LocationPermission.whileInUse;
   }
 
   Future<String?> allocateVehicleSlot() async {
-    return vehicleIds.first;
+    for (final vehicleId in vehicleIds) {
+      final reference = _vehiclesReference.child(vehicleId);
+
+      final result = await reference.runTransaction((Object? currentData) {
+        if (currentData is Map && currentData['active'] == true) {
+          return Transaction.abort();
+        }
+
+        return Transaction.success({
+          'vehicleId': vehicleId,
+          'active': true,
+          'status': 'STARTED',
+          'updatedAt': DateTime.now().toUtc().toIso8601String(),
+        });
+      }, applyLocally: false);
+
+      if (result.committed) {
+        print('ALLOCATED VEHICLE: $vehicleId');
+        return vehicleId;
+      }
+    }
+
+    print('NO AVAILABLE EVS');
+    return null;
   }
 
   Future<bool> startTracking() async {
-    if (_isTracking) {
-      return true;
-    }
+    if (_isTracking) return true;
 
     if (!await checkAndRequestPermission()) {
       return false;
     }
 
     final allocatedVehicleId = await allocateVehicleSlot();
-
-    if (allocatedVehicleId == null) {
-      return false;
-    }
+    if (allocatedVehicleId == null) return false;
 
     _vehicleId = allocatedVehicleId;
     _isTracking = true;
-    _lastValidPosition = null; // Reset history
+    _lastValidPosition = null;
 
-    await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
+    try {
+      await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
 
-    // Android configuration
-    final androidSettings = AndroidSettings(
-      accuracy: LocationAccuracy.bestForNavigation, // Upgraded from 'best' to navigation mode
-      distanceFilter: 2, // Only trigger stream if the driver moves at least 2 metres
-      intervalDuration: normalUpdateInterval,
-      foregroundNotificationConfig: const ForegroundNotificationConfig(
-        notificationTitle: 'VIT EV BUGGY',
-        notificationText: 'EV shift tracking is active',
-        enableWakeLock: true,
-        enableWifiLock: true,
-      ),
-    );
+      final androidSettings = AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 2,
+        intervalDuration: normalUpdateInterval,
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'VIT EV BUGGY',
+          notificationText: 'EV shift tracking is active',
+          enableWakeLock: true,
+          enableWifiLock: true,
+        ),
+      );
 
-    // iOS configuration (Added to match your Android performance)
-    final appleSettings = AppleSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 2,
-      activityType: ActivityType.otherNavigation,
-      pauseLocationUpdatesAutomatically: false,
-      showBackgroundLocationIndicator: true,
-    );
+      final appleSettings = AppleSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 2,
+        activityType: ActivityType.otherNavigation,
+        pauseLocationUpdatesAutomatically: false,
+        showBackgroundLocationIndicator: true,
+      );
 
-    final locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 2,
-      timeLimit: const Duration(seconds: 10),
-    );
+      final defaultSettings = LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 2,
+        timeLimit: const Duration(seconds: 10),
+      );
 
-    _positionSubscription = Geolocator.getPositionStream(
-      locationSettings: GetPlatformLocationSettings(
-        androidSettings: androidSettings,
-        appleSettings: appleSettings,
-        defaultSettings: locationSettings,
-      ),
-    ).listen(
-      _handlePosition,
-      onError: (Object error) {
-        print('LOCATION STREAM ERROR: $error');
-      },
-    );
+      print('STARTING LOCATION STREAM FOR $_vehicleId');
 
-    return true;
+      _positionSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: _getPlatformLocationSettings(
+              androidSettings: androidSettings,
+              appleSettings: appleSettings,
+              defaultSettings: defaultSettings,
+            ),
+          ).listen(
+            _handlePosition,
+            onError: (Object error) {
+              print('LOCATION STREAM ERROR: $error');
+            },
+            onDone: () {
+              print('LOCATION STREAM CLOSED');
+            },
+          );
+
+      return true;
+    } catch (error) {
+      print('START TRACKING ERROR: $error');
+      await releaseVehicleSlot(_vehicleId);
+      _vehicleId = null;
+      _isTracking = false;
+      _lastValidPosition = null;
+      return false;
+    }
   }
 
-  void _handlePosition(Position position) {
-    if (!_isTracking || _vehicleId == null) {
-      return;
-    }
+  Future<void> _handlePosition(Position position) async {
+    if (!_isTracking || _vehicleId == null) return;
 
-    // FILTER 1: Reject mathematically noisy fixes
+    final vehicleId = _vehicleId!;
+
     if (position.accuracy > maxAcceptableAccuracy) {
       print('REJECTED: Low accuracy fix (${position.accuracy}m)');
       return;
     }
 
     if (_lastValidPosition != null) {
-      // Calculate real distance shifted since the last approved coordinate
-      double distanceMoved = Geolocator.distanceBetween(
+      final distanceMoved = Geolocator.distanceBetween(
         _lastValidPosition!.latitude,
         _lastValidPosition!.longitude,
         position.latitude,
         position.longitude,
       );
 
-      // FILTER 2: Static Jitter Protection
-      // If the buggy is parked or waiting for faculty, don't update Firebase with ghost movements
       if (distanceMoved < minMovementThreshold) {
         return;
       }
 
-      // FILTER 3: Sanity Check / Teleportation Prevention
-      // Calculate how much time passed since the last coordinate
-      final double timeDeltaSeconds = (position.timestamp.difference(_lastValidPosition!.timestamp)).inMilliseconds / 1000.0;
-      
+      final timeDeltaSeconds =
+          position.timestamp
+              .difference(_lastValidPosition!.timestamp)
+              .inMilliseconds /
+          1000.0;
+
       if (timeDeltaSeconds > 0) {
-        double calculatedSpeed = distanceMoved / timeDeltaSeconds;
-        // If calculated speed implies the buggy broke campus speed limits drastically, it's a GPS bounce.
+        final calculatedSpeed = distanceMoved / timeDeltaSeconds;
+
         if (calculatedSpeed > maxBuggySpeedMetersPerSecond) {
           print('REJECTED: Impossible speed spike ($calculatedSpeed m/s)');
           return;
@@ -164,27 +185,31 @@ class LocationService {
       }
     }
 
-    // Clean data approved! Cache it and save to cloud.
     _lastValidPosition = position;
-    sendLocation(vehicleId: _vehicleId!, position: position);
+
+    try {
+      await sendLocation(vehicleId: vehicleId, position: position);
+      print('LOCATION UPDATED FOR $vehicleId');
+    } catch (error) {
+      print('SEND LOCATION ERROR FOR $vehicleId: $error');
+    }
   }
 
-  // Helper helper method to choose cross-platform configuration setup
-  LocationSettings GetPlatformLocationSettings({
+  LocationSettings _getPlatformLocationSettings({
     required AndroidSettings androidSettings,
     required AppleSettings appleSettings,
     required LocationSettings defaultSettings,
   }) {
-    // Packages automatically select platform rules under the hood
-    return androidSettings;
+    if (Platform.isAndroid) return androidSettings;
+    if (Platform.isIOS) return appleSettings;
+    return defaultSettings;
   }
 
   Future<void> stopTracking() async {
-    if (!_isTracking) {
-      return;
-    }
+    if (!_isTracking) return;
 
     final vehicleId = _vehicleId;
+
     await _positionSubscription?.cancel();
     _positionSubscription = null;
     _isTracking = false;
@@ -192,15 +217,16 @@ class LocationService {
     _lastValidPosition = null;
 
     if (vehicleId != null) {
-      await sendShiftEvent(vehicleId: vehicleId, status: 'ENDED');
-      await releaseVehicleSlot(vehicleId);
+      try {
+        await sendShiftEvent(vehicleId: vehicleId, status: 'ENDED');
+      } finally {
+        await releaseVehicleSlot(vehicleId);
+      }
     }
   }
 
   Future<void> releaseVehicleSlot(String? vehicleId) async {
-    if (vehicleId == null) {
-      return;
-    }
+    if (vehicleId == null) return;
 
     await _vehiclesReference.child(vehicleId).update({
       'active': false,
@@ -213,19 +239,17 @@ class LocationService {
     required String vehicleId,
     required Position position,
   }) async {
-    final locationPayload = {
+    await _vehiclesReference.child(vehicleId).update({
       'vehicleId': vehicleId,
       'latitude': position.latitude,
       'longitude': position.longitude,
       'timestamp': DateTime.now().toUtc().toIso8601String(),
       'speed': position.speed,
       'heading': position.heading,
-      'accuracy': position.accuracy, // Good to log this to debug campus dead zones
+      'accuracy': position.accuracy,
       'active': true,
       'status': 'ACTIVE',
-    };
-
-    await _vehiclesReference.child(vehicleId).set(locationPayload);
+    });
   }
 
   Future<void> sendShiftEvent({
