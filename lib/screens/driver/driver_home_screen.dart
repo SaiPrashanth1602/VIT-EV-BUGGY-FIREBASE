@@ -23,8 +23,9 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 
   // Temporary pilot value.
   // Final backend integration will identify the driver
-  // and allocate one of EV1-EV4 as the active tracking slot.
+  // and allocate one of EV1-EV2 as the active tracking slot.
   String? _activeVehicleId;
+  String? _selectedVehicleId;
 
   // Temporary pilot value.
   // Final app will obtain the driver's identity from authentication.
@@ -33,6 +34,9 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _restoreExistingShift();
+    });
 
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) {
@@ -48,8 +52,62 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   @override
   void dispose() {
     _clockTimer?.cancel();
-    _locationService.stopTracking();
     super.dispose();
+  }
+
+  Future<void> _restoreExistingShift() async {
+    try {
+      String? vehicleId;
+
+      // Firebase can take a short moment to reconnect after the app is
+      // reopened, so try more than once before deciding that no shift exists.
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        vehicleId = await _locationService.findExistingShift();
+        debugPrint(
+          'SHIFT RESTORE CHECK $attempt/3: ${vehicleId ?? 'NO ACTIVE SHIFT'}',
+        );
+
+        if (vehicleId != null) break;
+
+        if (attempt < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 700));
+        }
+      }
+
+      if (!mounted || vehicleId == null) return;
+
+      // Update the UI as soon as Firebase confirms the active shift.
+      // GPS reconnection must not control whether the shift card is shown.
+      setState(() {
+        _shiftActive = true;
+        _activeVehicleId = vehicleId;
+        _selectedVehicleId = vehicleId;
+        _isProcessing = true;
+      });
+
+      final restored = await _locationService.restoreTracking(vehicleId);
+
+      if (!mounted) return;
+
+      setState(() {
+        _isProcessing = false;
+      });
+
+      if (!restored) {
+        _showMessage(
+          'Shift restored: $vehicleId. Enable GPS/permission to resume tracking.',
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('SHIFT RESTORE ERROR: $error');
+      debugPrint('$stackTrace');
+
+      if (!mounted) return;
+
+      setState(() {
+        _isProcessing = false;
+      });
+    }
   }
 
   Future<void> _startShift() async {
@@ -57,11 +115,16 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       return;
     }
 
+    if (_selectedVehicleId == null) {
+      _showMessage('Please select an EV first.');
+      return;
+    }
+
     setState(() {
       _isProcessing = true;
     });
 
-    final started = await _locationService.startTracking();
+    final started = await _locationService.startTracking(_selectedVehicleId!);
 
     if (!mounted) {
       return;
@@ -101,6 +164,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       _isProcessing = false;
       _shiftActive = false;
       _activeVehicleId = null;
+      _selectedVehicleId = null;
     });
 
     _showMessage('Shift ended successfully.');
@@ -165,8 +229,6 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
                       _buildActiveShiftCard()
                     else
                       _buildStartShiftCard(),
-                    const SizedBox(height: 26),
-                    _buildInfoSection(),
                   ],
                 ),
               ),
@@ -285,6 +347,28 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
             ),
           ),
           const SizedBox(height: 24),
+          DropdownButtonFormField<String>(
+            value: _selectedVehicleId,
+            decoration: InputDecoration(
+              hintText: 'Choose EV',
+              filled: true,
+              fillColor: const Color(0xFFF2F8F4),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide.none,
+              ),
+            ),
+            items: const [
+              DropdownMenuItem(value: 'EV1', child: Text('EV1')),
+              DropdownMenuItem(value: 'EV2', child: Text('EV2')),
+            ],
+            onChanged: _isProcessing
+                ? null
+                : (value) {
+                    setState(() => _selectedVehicleId = value);
+                  },
+          ),
+          const SizedBox(height: 24),
           _buildPrimaryButton(
             label: 'START SHIFT',
             icon: Icons.play_arrow_rounded,
@@ -361,69 +445,6 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
           ),
           const SizedBox(height: 22),
           _buildEndShiftButton(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildInfoSection() {
-    return Row(
-      children: [
-        Expanded(
-          child: _buildInfoCard(
-            Icons.gps_fixed_rounded,
-            'GPS',
-            _shiftActive ? 'Tracking' : 'Inactive',
-          ),
-        ),
-        const SizedBox(width: 14),
-        Expanded(
-          child: _buildInfoCard(
-            Icons.sync_rounded,
-            'Updates',
-            _shiftActive ? 'Every 4 sec' : 'Waiting',
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildInfoCard(IconData icon, String title, String value) {
-    return Container(
-      padding: const EdgeInsets.all(17),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.05),
-            blurRadius: 16,
-            offset: const Offset(0, 6),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, size: 21, color: const Color(0xFF18864B)),
-          const SizedBox(height: 11),
-          Text(
-            title,
-            style: TextStyle(
-              color: Colors.grey.shade600,
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          const SizedBox(height: 3),
-          Text(
-            value,
-            style: const TextStyle(
-              color: Color(0xFF183B56),
-              fontSize: 15,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
         ],
       ),
     );

@@ -9,12 +9,18 @@ class LocationService {
 
   bool _isTracking = false;
   String? _vehicleId;
+  String? _lastError;
   Position? _lastValidPosition;
+  Timer? _heartbeatTimer;
+
+  static const String driverId = 'driver';
+  static const Duration heartbeatInterval = Duration(seconds: 30);
 
   bool get isTracking => _isTracking;
   String? get vehicleId => _vehicleId;
+  String? get lastError => _lastError;
 
-  static const List<String> vehicleIds = ['EV1', 'EV2', 'EV3', 'EV4'];
+  static const List<String> vehicleIds = ['EV1', 'EV2'];
   static const Duration normalUpdateInterval = Duration(seconds: 1);
 
   static const double maxAcceptableAccuracy = 25.0;
@@ -26,7 +32,9 @@ class LocationService {
   );
 
   Future<bool> checkAndRequestPermission() async {
+    _lastError = null;
     if (!await Geolocator.isLocationServiceEnabled()) {
+      _lastError = 'Location services are disabled. Please enable GPS.';
       print('LOCATION SERVICE IS DISABLED');
       return false;
     }
@@ -39,6 +47,8 @@ class LocationService {
 
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
+      _lastError =
+          'Location permission is denied. Please allow location access.';
       print('LOCATION PERMISSION DENIED: $permission');
       return false;
     }
@@ -47,49 +57,90 @@ class LocationService {
         permission == LocationPermission.whileInUse;
   }
 
-  Future<String?> allocateVehicleSlot() async {
-    for (final vehicleId in vehicleIds) {
-      final reference = _vehiclesReference.child(vehicleId);
+  Future<bool> claimVehicle(String selectedVehicleId) async {
+    _lastError = null;
+    if (!vehicleIds.contains(selectedVehicleId)) return false;
 
-      final result = await reference.runTransaction((Object? currentData) {
-        if (currentData is Map && currentData['active'] == true) {
-          return Transaction.abort();
-        }
+    final reference = _vehiclesReference.child(selectedVehicleId);
+    final result = await reference.runTransaction((Object? currentData) {
+      final data = currentData is Map
+          ? Map<String, dynamic>.from(currentData)
+          : <String, dynamic>{};
 
-        return Transaction.success({
-          'vehicleId': vehicleId,
-          'active': true,
-          'status': 'STARTED',
-          'updatedAt': DateTime.now().toUtc().toIso8601String(),
-        });
-      }, applyLocally: false);
+      final active = data['active'] == true;
 
-      if (result.committed) {
-        print('ALLOCATED VEHICLE: $vehicleId');
-        return vehicleId;
+      // An active EV cannot be claimed by another shift until END SHIFT.
+      // Closing the app or clearing Recents must not release the vehicle.
+      if (active) {
+        return Transaction.abort();
       }
-    }
 
-    print('NO AVAILABLE EVS');
-    return null;
+      data.addAll({
+        'vehicleId': selectedVehicleId,
+        'active': true,
+        'status': 'STARTED',
+        'driverId': driverId,
+        'shiftStartedAt': DateTime.now().toUtc().toIso8601String(),
+        'lastSeen': DateTime.now().toUtc().toIso8601String(),
+        'connectionState': 'CONNECTED',
+      });
+
+      return Transaction.success(data);
+    }, applyLocally: false);
+
+    if (!result.committed) {
+      _lastError =
+          '$selectedVehicleId is already running. Please choose another EV.';
+    }
+    return result.committed;
   }
 
-  Future<bool> startTracking() async {
+  Future<bool> startTracking(String selectedVehicleId) async {
+    return _activateTracking(selectedVehicleId, claim: true);
+  }
+
+  Future<bool> restoreTracking(String existingVehicleId) async {
+    if (_isTracking) return true;
+    return _activateTracking(existingVehicleId, claim: false);
+  }
+
+  Future<bool> _activateTracking(
+    String selectedVehicleId, {
+    required bool claim,
+  }) async {
     if (_isTracking) return true;
 
     if (!await checkAndRequestPermission()) {
       return false;
     }
 
-    final allocatedVehicleId = await allocateVehicleSlot();
-    if (allocatedVehicleId == null) return false;
+    if (claim) {
+      final claimed = await claimVehicle(selectedVehicleId);
+      if (!claimed) return false;
+    }
 
-    _vehicleId = allocatedVehicleId;
+    _vehicleId = selectedVehicleId;
     _isTracking = true;
     _lastValidPosition = null;
 
     try {
-      await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
+      if (claim) {
+        await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
+      } else {
+        // Reconnect an already active shift without creating a new STARTED event
+        // or changing the existing shift state.
+        await _vehiclesReference.child(_vehicleId!).update({
+          'vehicleId': _vehicleId,
+          'active': true,
+          'status': 'ACTIVE',
+          'driverId': driverId,
+          'connectionState': 'CONNECTED',
+          'lastSeen': DateTime.now().toUtc().toIso8601String(),
+        });
+      }
+
+      await _registerDisconnectHandler(_vehicleId!);
+      _startHeartbeat();
 
       final androidSettings = AndroidSettings(
         accuracy: LocationAccuracy.bestForNavigation,
@@ -139,7 +190,11 @@ class LocationService {
       return true;
     } catch (error) {
       print('START TRACKING ERROR: $error');
-      await releaseVehicleSlot(_vehicleId);
+      // Never end an existing shift just because reconnecting failed.
+      // Only a deliberate END SHIFT should release the vehicle.
+      if (claim) {
+        await releaseVehicleSlot(_vehicleId);
+      }
       _vehicleId = null;
       _isTracking = false;
       _lastValidPosition = null;
@@ -205,6 +260,51 @@ class LocationService {
     return defaultSettings;
   }
 
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) async {
+      final vehicleId = _vehicleId;
+      if (!_isTracking || vehicleId == null) return;
+      await _vehiclesReference.child(vehicleId).update({
+        'lastSeen': DateTime.now().toUtc().toIso8601String(),
+        'connectionState': 'CONNECTED',
+        'driverId': driverId,
+      });
+    });
+  }
+
+  Future<void> _registerDisconnectHandler(String vehicleId) async {
+    await _vehiclesReference.child(vehicleId).onDisconnect().update({
+      'connectionState': 'DISCONNECTED',
+    });
+  }
+
+  Future<String?> findExistingShift() async {
+    for (final vehicleId in vehicleIds) {
+      final snapshot = await _vehiclesReference.child(vehicleId).get();
+      if (!snapshot.exists || snapshot.value is! Map) continue;
+
+      final data = Map<String, dynamic>.from(snapshot.value as Map);
+      final active = data['active'] == true;
+      final status = data['status']?.toString().toUpperCase();
+
+      print(
+        'SHIFT CHECK $vehicleId: active=$active, status=$status, '
+        'driverId=${data['driverId']}',
+      );
+
+      // Firebase data shown by your app contains active=true and status=ACTIVE.
+      // Accept ACTIVE and STARTED so reopening works during either phase.
+      if (active && status != 'ENDED') {
+        print('EXISTING SHIFT FOUND: $vehicleId');
+        return vehicleId;
+      }
+    }
+
+    print('NO EXISTING ACTIVE SHIFT FOUND');
+    return null;
+  }
+
   Future<void> stopTracking() async {
     if (!_isTracking) return;
 
@@ -212,6 +312,8 @@ class LocationService {
 
     await _positionSubscription?.cancel();
     _positionSubscription = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     _isTracking = false;
     _vehicleId = null;
     _lastValidPosition = null;
@@ -249,6 +351,9 @@ class LocationService {
       'accuracy': position.accuracy,
       'active': true,
       'status': 'ACTIVE',
+      'driverId': driverId,
+      'lastSeen': DateTime.now().toUtc().toIso8601String(),
+      'connectionState': 'CONNECTED',
     });
   }
 
@@ -262,6 +367,9 @@ class LocationService {
       'vehicleId': vehicleId,
       'status': status,
       'active': status == 'STARTED',
+      'driverId': status == 'ENDED' ? null : driverId,
+      'lastSeen': timestamp,
+      'connectionState': status == 'ENDED' ? 'DISCONNECTED' : 'CONNECTED',
       'updatedAt': timestamp,
     });
 

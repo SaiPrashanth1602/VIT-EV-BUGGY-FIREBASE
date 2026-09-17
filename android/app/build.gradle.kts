@@ -1,13 +1,12 @@
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
     id("com.google.gms.google-services")
 }
 
 android {
-    namespace = "com.vit.evbuggy.driver"
+    namespace = "com.example.vit_ev_buggy"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -21,7 +20,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.vit.evbuggy.driver"
+        applicationId = "com.example.vit_ev_buggy"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
