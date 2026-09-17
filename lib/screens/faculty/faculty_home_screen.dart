@@ -65,7 +65,22 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   static const Color routeYellow = Color(0xFFFACC15);
   static const LatLng vitChennai = LatLng(12.8406, 80.1534);
 
+  // Muted/dull red for pickup pins — less saturated than Colors.red so it
+  // doesn't overpower the map visually.
+  static const Color pickupPinColor = Color(0xFFB33A3A);
+
+  // Draggable sheet size fractions — reused by both the sheet and the
+  // floating controls so they can compute their offset in sync.
+  static const double _sheetMinSize = 0.235;
+  static const double _sheetMaxSize = 0.66;
+
   final MapController _mapController = MapController();
+
+  // Controls the draggable schedule sheet AND lets the floating controls
+  // (GPS button, pickup legend) read its live size so they can move up
+  // together with it as the user drags.
+  final DraggableScrollableController _sheetController =
+      DraggableScrollableController();
 
   late final EvLocationProvider _evProvider =
       (Platform.isAndroid || Platform.isIOS) && Firebase.apps.isNotEmpty
@@ -80,22 +95,33 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   Timer? _evAvailabilityTimer;
 
   LatLng? _facultyPosition;
-  LatLng? _evPosition;
+
+  // Multi-vehicle state: every currently-active/online EV, keyed by its
+  // vehicleId (e.g. "EV1", "EV2"). Replaces the old single _evPosition /
+  // _evLocationAvailable / _evIsMoving fields, which could only ever hold
+  // one vehicle at a time — a second vehicle's updates were silently
+  // overwriting the first's.
+  final Map<String, EvLocation> _evLocations = {};
+
+  // Tracks per-block "arrival" state per vehicle, so EV1 and EV2 arriving
+  // at the same block independently trigger their own notifications.
+  final Set<String> _evInsideFacultyBlockIds = {};
 
   String? _facultyBlockName;
   String? _notificationMessage;
 
   // General "EV is at {block} pickup point" indicator — shows for EVERY
   // faculty user regardless of their own assigned block, updates live to
-  // whichever block the EV currently sits near. Independent of the
+  // whichever block ANY EV currently sits near. Independent of the
   // personal arrival notification below.
   String? _evAtBlockName;
 
   bool _locationAvailable = false;
-  bool _evLocationAvailable = false;
-  bool _evIsMoving = false;
-  bool _evInsideFacultyBlock = false;
   bool _hasInitialMapCentered = false;
+
+  // Live fraction (0.0-1.0) of how far the sheet is dragged, used to push
+  // the bottom controls upward in sync with the sheet's drag.
+  double _sheetExtent = _sheetMinSize;
 
   late AnimationController _pulseController;
   late AnimationController _glowController;
@@ -127,8 +153,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       duration: const Duration(milliseconds: 2200),
     )..repeat(reverse: true);
 
+    _sheetController.addListener(_handleSheetDrag);
+
     _facultyLocationService = FacultyLocationService();
     _initialize();
+  }
+
+  void _handleSheetDrag() {
+    if (!_sheetController.isAttached) return;
+    setState(() {
+      _sheetExtent = _sheetController.size;
+    });
   }
 
   Future<void> _initialize() async {
@@ -374,13 +409,15 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _mapController.move(facultyPosition, 16.8);
     }
 
-    if (facultyStop != null && _evPosition != null) {
-      _checkEvArrival(facultyPosition, facultyStop, _evPosition!);
+    if (facultyStop != null) {
+      for (final location in _evLocations.values) {
+        _checkEvArrival(facultyPosition, facultyStop, location);
+      }
     }
   }
 
   // ---------------------------------------------------------------------------
-  // EV LOCATION (FIREBASE REALTIME STREAM)
+  // EV LOCATION (FIREBASE REALTIME STREAM) — MULTI-VEHICLE
   // ---------------------------------------------------------------------------
 
   void _handleEvLocation(EvLocation location) {
@@ -389,30 +426,47 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final now = DateTime.now().toUtc();
     final isStale = now.difference(location.timestamp).inSeconds > 180;
 
-    // If stream pushes a stale timestamp, treat EV as offline
+    // A stale update for THIS vehicle only removes that vehicle, not the
+    // others — e.g. if EV2 goes quiet, EV1's marker must stay untouched.
     if (isStale) {
-      _clearEvLocation();
+      _removeEvLocation(location.vehicleId);
       return;
     }
 
-    final position = location.position;
-    final isMoving = location.speed >= 1.0;
-
     setState(() {
-      _evPosition = position;
-      _evLocationAvailable = true;
-      _evIsMoving = isMoving;
+      _evLocations[location.vehicleId] = location;
     });
 
-    // Runs for every faculty user regardless of their own block.
-    _checkEvNearAnyBlock(position);
+    // Runs for every faculty user regardless of their own block, checked
+    // against every currently known vehicle.
+    _checkEvNearAnyBlock();
 
     if (_facultyPosition == null) return;
 
     final facultyStop = EvTrackingService().findFacultyBlock(_facultyPosition!);
     if (facultyStop == null) return;
 
-    _checkEvArrival(_facultyPosition!, facultyStop, position);
+    _checkEvArrival(_facultyPosition!, facultyStop, location);
+  }
+
+  void _removeEvLocation(String vehicleId) {
+    if (!mounted) return;
+
+    setState(() {
+      _evLocations.remove(vehicleId);
+    });
+
+    if (_evInsideFacultyBlockIds.remove(vehicleId) &&
+        _evInsideFacultyBlockIds.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _notificationMessage = null;
+        });
+      }
+      NotificationService.instance.cancelEvArrival();
+    }
+
+    _checkEvNearAnyBlock();
   }
 
   // ---------------------------------------------------------------------------
@@ -431,17 +485,27 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         if (!mounted) return;
 
         if (locations.isEmpty) {
-          _clearEvLocation();
+          _clearAllEvLocations();
           return;
         }
 
-        // Check timestamp of the latest vehicle location
-        final latestLocation = locations.first;
         final now = DateTime.now().toUtc();
+        final activeIds = <String>{};
 
-        // If driver stopped sending coordinates for over 3 minutes
-        if (now.difference(latestLocation.timestamp).inSeconds > 180) {
-          _clearEvLocation();
+        for (final loc in locations) {
+          if (now.difference(loc.timestamp).inSeconds <= 180) {
+            activeIds.add(loc.vehicleId);
+          }
+        }
+
+        // Drop any vehicle we're currently showing that isn't in the
+        // fresh active list anymore (per-vehicle offline detection).
+        final staleIds = _evLocations.keys
+            .where((id) => !activeIds.contains(id))
+            .toList();
+
+        for (final id in staleIds) {
+          _removeEvLocation(id);
         }
       } catch (_) {
         // Soft fail protection
@@ -449,18 +513,16 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
   }
 
-  void _clearEvLocation() {
+  void _clearAllEvLocations() {
     if (!mounted) return;
 
     setState(() {
-      _evPosition = null;
-      _evIsMoving = false;
-      _evLocationAvailable = false;
+      _evLocations.clear();
       _notificationMessage = null;
       _evAtBlockName = null;
     });
 
-    _evInsideFacultyBlock = false;
+    _evInsideFacultyBlockIds.clear();
 
     NotificationService.instance.cancelEvArrival();
   }
@@ -472,34 +534,43 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   void _checkEvArrival(
     LatLng facultyPosition,
     CampusStop facultyStop,
-    LatLng evPosition,
+    EvLocation evLocation,
   ) {
     final trackingService = EvTrackingService();
-    final evNear = trackingService.isEvNearStop(evPosition, facultyStop);
+    final evNear = trackingService.isEvNearStop(
+      evLocation.position,
+      facultyStop,
+    );
+
+    final vehicleId = evLocation.vehicleId;
 
     if (evNear) {
-      if (!_evInsideFacultyBlock) {
-        _evInsideFacultyBlock = true;
+      if (!_evInsideFacultyBlockIds.contains(vehicleId)) {
+        _evInsideFacultyBlockIds.add(vehicleId);
 
         if (mounted) {
           setState(() {
-            _notificationMessage = 'EV is arriving at ${facultyStop.name}';
+            _notificationMessage =
+                '$vehicleId is arriving at ${facultyStop.name}';
           });
         }
 
         NotificationService.instance.showEvArrival(blockName: facultyStop.name);
       }
     } else {
-      if (_evInsideFacultyBlock) {
-        _evInsideFacultyBlock = false;
-
+      if (_evInsideFacultyBlockIds.remove(vehicleId)) {
         if (mounted) {
           setState(() {
-            _notificationMessage = null;
+            // Only clear the banner if no other vehicle is still inside.
+            if (_evInsideFacultyBlockIds.isEmpty) {
+              _notificationMessage = null;
+            }
           });
         }
 
-        NotificationService.instance.cancelEvArrival();
+        if (_evInsideFacultyBlockIds.isEmpty) {
+          NotificationService.instance.cancelEvArrival();
+        }
       }
     }
   }
@@ -508,27 +579,27 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // EV AT ANY BLOCK — general pickup-point indicator (shown to ALL users)
   // ---------------------------------------------------------------------------
 
-  void _checkEvNearAnyBlock(LatLng evPosition) {
-  final trackingService = EvTrackingService();
+  void _checkEvNearAnyBlock() {
+    final trackingService = EvTrackingService();
 
-  String? matchedBlockName;
+    String? matchedBlockName;
 
-  for (final block in _campusBlocks) {
-    final stop = trackingService.findFacultyBlock(block.value);
-    if (stop == null) continue;
+    for (final location in _evLocations.values) {
+      for (final stop in EvTrackingService.campusStops) {
+        if (trackingService.isEvNearStop(location.position, stop)) {
+          matchedBlockName = stop.name;
+          break;
+        }
+      }
+      if (matchedBlockName != null) break;
+    }
 
-    if (trackingService.isEvNearStop(evPosition, stop)) {
-      matchedBlockName = stop.name;
-      break;
+    if (matchedBlockName != _evAtBlockName && mounted) {
+      setState(() {
+        _evAtBlockName = matchedBlockName;
+      });
     }
   }
-
-  if (matchedBlockName != _evAtBlockName && mounted) {
-    setState(() {
-      _evAtBlockName = matchedBlockName;
-    });
-  }
-}
 
   Future<void> _showLocationRequiredDialog({
     required String title,
@@ -628,6 +699,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   void dispose() {
     _pulseController.dispose();
     _glowController.dispose();
+    _sheetController.removeListener(_handleSheetDrag);
+    _sheetController.dispose();
 
     _evAvailabilityTimer?.cancel();
     _evSubscription?.cancel();
@@ -649,6 +722,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   @override
   Widget build(BuildContext context) {
     final facultyBlockName = _facultyBlockName ?? 'Not assigned';
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    // How far above the bottom of the screen the sheet's visible top edge
+    // currently sits, in logical pixels — used to float the GPS button
+    // and pickup legend just above the sheet, moving with it as dragged.
+    final sheetTopOffset = (screenHeight * _sheetExtent) + 14;
+
+    final anyEvAvailable = _evLocations.isNotEmpty;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: const SystemUiOverlayStyle(
@@ -685,21 +766,32 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                   userAgentPackageName: 'com.vit.evbuggy',
                 ),
                 Container(color: Colors.black.withValues(alpha: 0.18)),
+                // ── Glowing thin route lines ──────────────────────────────
                 PolylineLayer(
                   polylines: [
                     Polyline(
                       points: EvTrackingService.buggyRoadYellow,
-                      color: routeYellow.withValues(alpha: 0.85),
-                      strokeWidth: 5.5,
-                      borderStrokeWidth: 1.5,
-                      borderColor: Colors.black.withValues(alpha: 0.25),
+                      color: routeYellow.withValues(alpha: 0.35),
+                      strokeWidth: 9,
                     ),
                     Polyline(
                       points: EvTrackingService.buggyRoadOrange,
-                      color: Colors.orange.shade400.withValues(alpha: 0.9),
-                      strokeWidth: 5.5,
-                      borderStrokeWidth: 1.5,
-                      borderColor: Colors.black.withValues(alpha: 0.25),
+                      color: Colors.orange.shade400.withValues(alpha: 0.35),
+                      strokeWidth: 9,
+                    ),
+                  ],
+                ),
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: EvTrackingService.buggyRoadYellow,
+                      color: routeYellow,
+                      strokeWidth: 2.6,
+                    ),
+                    Polyline(
+                      points: EvTrackingService.buggyRoadOrange,
+                      color: Colors.orange.shade400,
+                      strokeWidth: 2.6,
                     ),
                   ],
                 ),
@@ -707,26 +799,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ],
             ),
 
-            // ── Top Floating Controls ────────────────────────────────────────
-            SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                child: Row(
-                  children: [
-                    _buildPickupLegend(),
-                    const Spacer(),
-                    _buildMapControl(),
-                  ],
-                ),
-              ),
-            ),
-
             // ── Location Warning ────────────────────────────────────────────
             if (!_locationAvailable)
               Positioned(
                 left: 16,
                 right: 16,
-                top: MediaQuery.of(context).padding.top + 78,
+                top: MediaQuery.of(context).padding.top + 12,
                 child: _buildLocationWarning(),
               ),
 
@@ -735,7 +813,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               Positioned(
                 left: 16,
                 right: 16,
-                top: MediaQuery.of(context).padding.top + 78,
+                top: MediaQuery.of(context).padding.top + 12,
                 child: _buildEvAtBlockBanner(_evAtBlockName!),
               ),
 
@@ -747,13 +825,30 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 top:
                     MediaQuery.of(context).padding.top +
                     (_evAtBlockName != null
-                        ? 154
-                        : (_locationAvailable ? 78 : 158)),
+                        ? 88
+                        : (_locationAvailable ? 12 : 92)),
                 child: _buildNotificationBanner(),
               ),
 
+            // ── Bottom-left: Pickup legend — floats just above the sheet,
+            //     and rides up with it as the sheet is dragged ─────────────
+            Positioned(
+              left: 16,
+              bottom: sheetTopOffset,
+              child: _buildPickupLegend(),
+            ),
+
+            // ── Bottom-right: GPS recenter button — same behavior ────────────
+            Positioned(
+              right: 16,
+              bottom: sheetTopOffset,
+              child: _buildMapControl(),
+            ),
+
             // ── Draggable Shuttle Schedule Sheet ─────────────────────────────
-            Positioned.fill(child: _buildPilotCard(facultyBlockName)),
+            Positioned.fill(
+              child: _buildPilotCard(facultyBlockName, anyEvAvailable),
+            ),
           ],
         ),
       ),
@@ -805,26 +900,21 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           AnimatedBuilder(
             animation: _glowController,
             builder: (context, child) {
-              final glow = 0.35 + (_glowController.value * 0.25);
-              return Container(
-                width: 14,
-                height: 14,
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade500,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.blue.withValues(alpha: glow),
-                      blurRadius: 12,
-                      spreadRadius: 2,
-                    ),
-                  ],
-                ),
+              final glow = 0.25 + (_glowController.value * 0.15);
+              return Icon(
+                Icons.location_on_rounded,
+                color: pickupPinColor,
+                size: 18,
+                shadows: [
+                  Shadow(
+                    color: pickupPinColor.withValues(alpha: glow),
+                    blurRadius: 8,
+                  ),
+                ],
               );
             },
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
           const Text(
             'PICKUP POINTS',
             style: TextStyle(
@@ -891,58 +981,62 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       markers.add(_buildFacultyMarker());
     }
 
-    // EV Buggy Marker (Firebase Live Animated Green Vehicle Pin)
-    if (_evLocationAvailable && _evPosition != null) {
-      markers.add(_buildVehicleMarker());
+    // EV Buggy Markers — one per currently active vehicle (EV1, EV2, ...).
+    // If a vehicle goes offline, it's removed from _evLocations and its
+    // marker simply stops being added here; other vehicles are untouched.
+    for (final location in _evLocations.values) {
+      markers.add(_buildVehicleMarker(location));
     }
 
     return markers;
   }
 
+  // Standard Google-Maps-style pin using Flutter's built-in Material icon,
+  // in a muted/dulled red so it doesn't overpower the map visually.
   Marker _buildPickupMarker(LatLng position) {
+    const pinSize = 40.0;
+
     return Marker(
       point: position,
-      width: 56,
-      height: 56,
+      width: pinSize,
+      height: pinSize,
+      alignment: Alignment.topCenter,
       child: AnimatedBuilder(
         animation: _glowController,
         builder: (context, child) {
-          final glow = 0.35 + (_glowController.value * 0.25);
-          final haloSize = 34 + (_glowController.value * 8);
+          final glow = 0.20 + (_glowController.value * 0.15);
 
           return Stack(
-            alignment: Alignment.center,
+            alignment: Alignment.topCenter,
             children: [
-              Container(
-                width: haloSize,
-                height: haloSize,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.blue.withValues(alpha: 0.10),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.blue.withValues(alpha: glow),
-                      blurRadius: 20,
-                      spreadRadius: 5,
-                    ),
-                  ],
+              Positioned(
+                top: 2,
+                child: Container(
+                  width: 26,
+                  height: 26,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: pickupPinColor.withValues(alpha: glow),
+                        blurRadius: 12,
+                        spreadRadius: 1.5,
+                      ),
+                    ],
+                  ),
                 ),
               ),
-              Container(
-                width: 16,
-                height: 16,
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade500,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2.5),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.blue.withValues(alpha: 0.80),
-                      blurRadius: 10,
-                      spreadRadius: 1.5,
-                    ),
-                  ],
-                ),
+              Icon(
+                Icons.location_on_rounded,
+                color: pickupPinColor,
+                size: pinSize,
+                shadows: [
+                  Shadow(
+                    color: Colors.black.withValues(alpha: 0.35),
+                    offset: const Offset(0, 2),
+                    blurRadius: 3,
+                  ),
+                ],
               ),
             ],
           );
@@ -951,17 +1045,19 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  Marker _buildVehicleMarker() {
+  // Now takes the specific EvLocation it represents, so each vehicle gets
+  // its own marker with its own label and its own moving/stationary state.
+  Marker _buildVehicleMarker(EvLocation location) {
+    final isMoving = location.speed >= 1.0;
+
     return Marker(
-      point: _evPosition!,
+      point: location.position,
       width: 92,
       height: 92,
       child: AnimatedBuilder(
         animation: _pulseController,
         builder: (context, child) {
-          final scale = _evIsMoving
-              ? 1.0
-              : 1.0 + (_pulseController.value * 0.07);
+          final scale = isMoving ? 1.0 : 1.0 + (_pulseController.value * 0.07);
           return Transform.scale(
             scale: scale,
             child: Column(
@@ -1014,9 +1110,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       ),
                     ],
                   ),
-                  child: const Text(
-                    'EV1',
-                    style: TextStyle(
+                  child: Text(
+                    location.vehicleId,
+                    style: const TextStyle(
                       color: vitBlue,
                       fontSize: 11.5,
                       fontWeight: FontWeight.w800,
@@ -1367,22 +1463,27 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // BOTTOM DRAGGABLE CARD
   // ---------------------------------------------------------------------------
 
-  Widget _buildPilotCard(String facultyBlockName) {
+  Widget _buildPilotCard(String facultyBlockName, bool anyEvAvailable) {
     final nextShuttle = _nextScheduledShuttle(facultyBlockName);
     final upcoming = _upcomingSchedule(facultyBlockName);
 
-    // No STOPPED state shown at all — either moving (shown as active/live)
-    // or offline. Standing still no longer surfaces a distinct label.
-    final String evStatus = !_evLocationAvailable
-        ? 'Waiting for live shuttle location'
-        : 'EV1 is online';
+    // Lists which vehicles are currently online, e.g. "EV1, EV2 online"
+    // or "EV1 online" if only one is active.
+    final String evStatus;
+    if (!anyEvAvailable) {
+      evStatus = 'Waiting for live shuttle location';
+    } else {
+      final ids = _evLocations.keys.toList()..sort();
+      evStatus = '${ids.join(', ')} online';
+    }
 
     return DraggableScrollableSheet(
-      initialChildSize: 0.235,
-      minChildSize: 0.235,
-      maxChildSize: 0.66,
+      controller: _sheetController,
+      initialChildSize: _sheetMinSize,
+      minChildSize: _sheetMinSize,
+      maxChildSize: _sheetMaxSize,
       snap: true,
-      snapSizes: const [0.235, 0.66],
+      snapSizes: const [_sheetMinSize, _sheetMaxSize],
       builder: (context, scrollController) {
         return Container(
           margin: const EdgeInsets.fromLTRB(12, 0, 12, 10),
@@ -1478,7 +1579,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       ],
                     ),
                   ),
-                  _buildStatusBadge(),
+                  _buildStatusBadge(anyEvAvailable),
                 ],
               ),
 
@@ -1595,58 +1696,37 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   Widget _buildScheduleRow(_ScheduleEntry entry) {
-  final hasDirection = entry.direction.isNotEmpty;
+    final hasDirection = entry.direction.isNotEmpty;
 
-  return Container(
-    margin: const EdgeInsets.only(bottom: 7),
-    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-    decoration: BoxDecoration(
-      color: Colors.grey.withValues(alpha: 0.045),
-      borderRadius: BorderRadius.circular(13),
-      border: Border.all(color: Colors.grey.withValues(alpha: 0.10)),
-    ),
-    child: Row(
-      children: [
-        SizedBox(
-          width: 52,
-          child: Text(
-            _formatScheduleTime(entry.time),
-            style: const TextStyle(
-              color: vitBlue,
-              fontSize: 12,
-              fontWeight: FontWeight.w800,
+    return Container(
+      margin: const EdgeInsets.only(bottom: 7),
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+      decoration: BoxDecoration(
+        color: Colors.grey.withValues(alpha: 0.045),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: Colors.grey.withValues(alpha: 0.10)),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 52,
+            child: Text(
+              _formatScheduleTime(entry.time),
+              style: const TextStyle(
+                color: vitBlue,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
             ),
           ),
-        ),
-        Container(
-          width: 1,
-          height: 28,
-          color: Colors.grey.withValues(alpha: 0.18),
-        ),
-        const SizedBox(width: 11),
-        // When direction is blank, the vehicle chip takes over the row
-        // instead of leaving a spare Expanded column for a dash.
-        hasDirection
-            ? Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 4,
-                ),
-                decoration: BoxDecoration(
-                  color: vitGreen.withValues(alpha: 0.10),
-                  borderRadius: BorderRadius.circular(7),
-                ),
-                child: Text(
-                  entry.vehicle,
-                  style: const TextStyle(
-                    color: vitGreen,
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-              )
-            : Expanded(
-                child: Container(
+          Container(
+            width: 1,
+            height: 28,
+            color: Colors.grey.withValues(alpha: 0.18),
+          ),
+          const SizedBox(width: 11),
+          hasDirection
+              ? Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 8,
                     vertical: 4,
@@ -1655,7 +1735,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                     color: vitGreen.withValues(alpha: 0.10),
                     borderRadius: BorderRadius.circular(7),
                   ),
-                  alignment: Alignment.center,
                   child: Text(
                     entry.vehicle,
                     style: const TextStyle(
@@ -1664,25 +1743,44 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       fontWeight: FontWeight.w900,
                     ),
                   ),
+                )
+              : Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: vitGreen.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(7),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      entry.vehicle,
+                      style: const TextStyle(
+                        color: vitGreen,
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                ),
+          if (hasDirection) const SizedBox(width: 9),
+          if (hasDirection)
+            Expanded(
+              child: Text(
+                entry.direction,
+                style: TextStyle(
+                  color: Colors.grey.shade700,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-        if (hasDirection) const SizedBox(width: 9),
-        if (hasDirection)
-          Expanded(
-            child: Text(
-              entry.direction,
-              style: TextStyle(
-                color: Colors.grey.shade700,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
             ),
-          ),
-      ],
-    ),
-  );
-}
-
+        ],
+      ),
+    );
+  }
 
   Widget _buildScheduleEmpty(String text) {
     return Container(
@@ -1741,8 +1839,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   // Status badge: only ONLINE or OFFLINE. No MOVING/STOPPED distinction.
-  Widget _buildStatusBadge() {
-    if (!_evLocationAvailable) {
+  Widget _buildStatusBadge(bool anyEvAvailable) {
+    if (!anyEvAvailable) {
       return _statusChip(
         label: 'OFFLINE',
         color: Colors.orange.shade800,
