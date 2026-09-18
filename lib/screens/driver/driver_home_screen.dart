@@ -34,6 +34,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   @override
   void initState() {
     super.initState();
+    _locationService.onConnectionChanged = _handleConnectionChanged;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _restoreExistingShift();
     });
@@ -52,6 +53,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   @override
   void dispose() {
     _clockTimer?.cancel();
+    _locationService.onConnectionChanged = null;
     super.dispose();
   }
 
@@ -95,7 +97,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 
       if (!restored) {
         _showMessage(
-          'Shift restored: $vehicleId. Enable GPS/permission to resume tracking.',
+          'Your shift is active, but location tracking could not restart. Please enable GPS and check permissions.',
         );
       }
     } catch (error, stackTrace) {
@@ -116,7 +118,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
 
     if (_selectedVehicleId == null) {
-      _showMessage('Please select an EV first.');
+      _showMessage('Please select an EV before starting your shift.');
       return;
     }
 
@@ -124,7 +126,9 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       _isProcessing = true;
     });
 
-    final started = await _locationService.startTracking(_selectedVehicleId!);
+    final started = await _locationService
+        .startTracking(_selectedVehicleId!)
+        .timeout(const Duration(seconds: 12), onTimeout: () => false);
 
     if (!mounted) {
       return;
@@ -137,10 +141,13 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     });
 
     if (!started) {
-      _showMessage('Location permission or GPS service is unavailable.');
+      _showMessage(
+        _locationService.lastErrorMessage ??
+            'Unable to connect to the server. Please check your internet connection and try again.',
+      );
     } else {
       _showMessage(
-        'Shift started. ${_activeVehicleId ?? 'EV'} tracking is active.',
+        'Shift started successfully. ${_activeVehicleId ?? 'EV'} tracking is now active.',
       );
     }
   }
@@ -154,20 +161,80 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       _isProcessing = true;
     });
 
-    await _locationService.stopTracking();
+    try {
+      await _locationService.stopTracking().timeout(
+        const Duration(seconds: 12),
+      );
 
-    if (!mounted) {
-      return;
+      if (!mounted) return;
+
+      setState(() {
+        _isProcessing = false;
+        _shiftActive = false;
+        _activeVehicleId = null;
+        _selectedVehicleId = null;
+      });
+
+      _showMessage('Shift ended successfully. Location tracking stopped.');
+    } catch (error) {
+      debugPrint('END SHIFT ERROR: $error');
+      if (!mounted) return;
+      setState(() => _isProcessing = false);
+      _showMessage(
+        'Unable to end your shift. Please check your connection and try again.',
+      );
     }
+  }
+
+  bool _networkWarningShown = false;
+  bool _isNetworkConnected = true;
+
+  void _handleConnectionChanged(bool connected) {
+    if (!mounted) return;
+
+    final wasDisconnected = !_isNetworkConnected;
 
     setState(() {
-      _isProcessing = false;
-      _shiftActive = false;
-      _activeVehicleId = null;
-      _selectedVehicleId = null;
+      _isNetworkConnected = connected;
+      _networkWarningShown = !connected;
     });
 
-    _showMessage('Shift ended successfully.');
+    if (_shiftActive && connected && wasDisconnected) {
+      _showMessage(
+        'Network connection restored. EV location tracking has resumed.',
+      );
+    }
+  }
+
+  Widget _buildNetworkStatusBanner() {
+    if (_isNetworkConnected || !_shiftActive) {
+      return const SizedBox.shrink();
+    }
+
+    return Material(
+      color: Colors.red.shade700,
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              const Icon(Icons.wifi_off, color: Colors.white),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text(
+                  'Network connection lost. Location updates will resume when the connection returns.',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _showMessage(String message) {
@@ -217,6 +284,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
         child: Column(
           children: [
             _buildHeader(),
+            _buildNetworkStatusBanner(),
             Expanded(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.fromLTRB(24, 26, 24, 32),
