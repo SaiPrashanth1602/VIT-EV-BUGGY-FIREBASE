@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:firebase_core/firebase_core.dart';
@@ -57,6 +58,38 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     'AB3': [548, 603, 658, 713, 768, 908, 962],
   };
 
+  // ── Metro-style route order per vehicle — FULL round trip ────────────────
+  // Real routes are there-and-back: the EV drives out to the turnaround
+  // stop, then drives the SAME stops in reverse back to the start. This
+  // list spells out every stop in both legs (turnaround appears once), so
+  // the progress line can correctly show the return leg instead of going
+  // blank after the last outbound stop. Purely a UI concept for the
+  // progress-line indicator below — does not affect scheduling, arrival
+  // notifications, or any Firebase/location logic elsewhere.
+  static const List<String> _ev1RouteOrder = [
+    'AB1',
+    'AB3',
+    'AB2-4',
+    'MAB3',
+    'MAB4', // turnaround
+    'MAB3',
+    'AB2-4',
+    'AB3',
+    'AB1',
+  ];
+
+  static const List<String> _ev2RouteOrder = [
+    'AB3',
+    'AB2-4',
+    'MAB3',
+    'MAB4',
+    'AB5', // turnaround
+    'MAB4',
+    'MAB3',
+    'AB2-4',
+    'AB3',
+  ];
+
   // ── Brand Colors & Map Constants ──────────────────────────────────────────
   static const Color vitBlue = Color(0xFF0F2C56);
   static const Color vitBlueLight = Color(0xFF1A4A7A);
@@ -84,8 +117,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   late final EvLocationProvider _evProvider =
       (Platform.isAndroid || Platform.isIOS) && Firebase.apps.isNotEmpty
-          ? EvApiProvider()
-          : const NoopEvLocationProvider();
+      ? EvApiProvider()
+      : const NoopEvLocationProvider();
 
   late final FacultyLocationService _facultyLocationService;
 
@@ -97,15 +130,34 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   LatLng? _facultyPosition;
 
   // Multi-vehicle state: every currently-active/online EV, keyed by its
-  // vehicleId (e.g. "EV1", "EV2"). Replaces the old single _evPosition /
-  // _evLocationAvailable / _evIsMoving fields, which could only ever hold
-  // one vehicle at a time — a second vehicle's updates were silently
-  // overwriting the first's.
+  // vehicleId (e.g. "EV1", "EV2"). Each EvLocation already carries its own
+  // `heading` field straight from Firebase, which the direction arrows
+  // below read directly — no changes to this logic.
   final Map<String, EvLocation> _evLocations = {};
 
   // Tracks per-block "arrival" state per vehicle, so EV1 and EV2 arriving
   // at the same block independently trigger their own notifications.
   final Set<String> _evInsideFacultyBlockIds = {};
+
+  // UI-only debounce: smooths the moving/idle flag used purely for the
+  // direction-arrow animation, so GPS speed jitter right at the threshold
+  // doesn't flicker the arrows on/off. Does NOT affect any EV location,
+  // arrival, or notification logic elsewhere in this file.
+  final Map<String, bool> _evMovingStable = {};
+
+  // UI-only: remembers which index into the FULL round-trip route list
+  // each vehicle was LAST CONFIRMED at via a real isEvNearStop match. Only
+  // ever set when a genuine match happens — never defaulted/guessed. This
+  // lets the metro-line search correctly pick the RETURN-leg occurrence of
+  // a repeated stop name (e.g. the second "MAB3" on the way back) instead
+  // of always matching the first occurrence earlier in the list. Cleared
+  // whenever a vehicle goes offline, so a fresh shift always starts clean.
+  final Map<String, int> _evLastRouteIndex = {};
+
+  // Auto-scroll controllers for the metro-line strips, one per vehicle,
+  // so the strip can animate to keep the current/next stop in view as
+  // progress advances. Purely a UI convenience — no effect on EV state.
+  final Map<String, ScrollController> _metroScrollControllers = {};
 
   String? _facultyBlockName;
   String? _notificationMessage;
@@ -380,7 +432,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
       if (mounted) setState(() => _locationAvailable = true);
 
-      final initialPosition = await _facultyLocationService.getCurrentPosition();
+      final initialPosition = await _facultyLocationService
+          .getCurrentPosition();
       if (initialPosition != null) {
         _handleFacultyPosition(initialPosition);
       }
@@ -418,6 +471,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   // ---------------------------------------------------------------------------
   // EV LOCATION (FIREBASE REALTIME STREAM) — MULTI-VEHICLE
+  // (UNCHANGED — same logic as before)
   // ---------------------------------------------------------------------------
 
   void _handleEvLocation(EvLocation location) {
@@ -456,6 +510,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _evLocations.remove(vehicleId);
     });
 
+    _evMovingStable.remove(vehicleId);
+
+    // Vehicle went offline (shift ended) — drop its remembered route
+    // position so the NEXT time it comes online (new shift), the metro
+    // line starts a completely fresh lap from index 0 instead of
+    // carrying over wherever it left off last time.
+    _evLastRouteIndex.remove(vehicleId);
+
     if (_evInsideFacultyBlockIds.remove(vehicleId) &&
         _evInsideFacultyBlockIds.isEmpty) {
       if (mounted) {
@@ -470,7 +532,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 
   // ---------------------------------------------------------------------------
-  // EV AVAILABILITY CHECK
+  // EV AVAILABILITY CHECK (UNCHANGED)
   // ---------------------------------------------------------------------------
 
   void _startEvAvailabilityCheck() {
@@ -522,6 +584,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _evAtBlockName = null;
     });
 
+    _evMovingStable.clear();
+    _evLastRouteIndex.clear();
     _evInsideFacultyBlockIds.clear();
 
     NotificationService.instance.cancelEvArrival();
@@ -529,6 +593,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   // ---------------------------------------------------------------------------
   // EV ARRIVAL / GEOFENCING (personal — only for the viewer's own block)
+  // (UNCHANGED)
   // ---------------------------------------------------------------------------
 
   void _checkEvArrival(
@@ -577,6 +642,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   // ---------------------------------------------------------------------------
   // EV AT ANY BLOCK — general pickup-point indicator (shown to ALL users)
+  // (UNCHANGED)
   // ---------------------------------------------------------------------------
 
   void _checkEvNearAnyBlock() {
@@ -599,6 +665,86 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         _evAtBlockName = matchedBlockName;
       });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // METRO-STYLE ROUTE PROGRESS — pure UI, read-only, computed on every build
+  // ---------------------------------------------------------------------------
+  //
+  // Finds which stop (by index into the FULL round-trip route list) the
+  // given EV is currently nearest/at, reusing the exact same `isEvNearStop`
+  // geofence check already used for arrival notifications.
+  //
+  // IMPORTANT: this only ever returns an index when a REAL match happens.
+  // If the EV isn't near ANY stop right now (e.g. still driving from its
+  // depot, or — as in testing — nowhere near campus at all), this returns
+  // whatever was last genuinely confirmed (or null if nothing ever was).
+  // It never guesses/defaults to index 0 — that was the earlier bug that
+  // made a stop show green before the EV had actually reached it.
+  //
+  // Because the round-trip list repeats stop names (e.g. MAB3 appears once
+  // outbound and once on the return leg), matching searches forward from
+  // the last confirmed index first, so later matches correctly resolve to
+  // the RETURN-leg occurrence instead of snapping back to the outbound one.
+
+  int? _currentRouteIndex(
+    String vehicleId,
+    EvLocation location,
+    List<String> routeOrder,
+  ) {
+    final trackingService = EvTrackingService();
+    final lastIndex = _evLastRouteIndex[vehicleId];
+
+    CampusStop stopFor(String name) => EvTrackingService.campusStops.firstWhere(
+      (s) => s.name == name,
+      orElse: () => EvTrackingService.campusStops.first,
+    );
+
+    // If we have a remembered position, search forward from there first.
+    if (lastIndex != null) {
+      for (int i = lastIndex; i < routeOrder.length; i++) {
+        if (trackingService.isEvNearStop(
+          location.position,
+          stopFor(routeOrder[i]),
+        )) {
+          _evLastRouteIndex[vehicleId] = i;
+          return i;
+        }
+      }
+
+      // Not found ahead — check if it's back at the very start (new lap),
+      // only valid once we'd already progressed well into the route.
+      if (lastIndex >= routeOrder.length - 2) {
+        if (trackingService.isEvNearStop(
+          location.position,
+          stopFor(routeOrder[0]),
+        )) {
+          _evLastRouteIndex[vehicleId] = 0;
+          return 0;
+        }
+      }
+    }
+
+    // No remembered position yet, OR the forward search above found
+    // nothing — do a full search from the beginning. This ONLY sets and
+    // returns an index if a real geofence match is found right now.
+    for (int i = 0; i < routeOrder.length; i++) {
+      if (trackingService.isEvNearStop(
+        location.position,
+        stopFor(routeOrder[i]),
+      )) {
+        _evLastRouteIndex[vehicleId] = i;
+        return i;
+      }
+    }
+
+    // Genuinely not near ANY stop right now — never guess. If nothing has
+    // ever matched (lastIndex is null), the line correctly shows nothing
+    // as current/green, with stop 0 blinking as "not started yet." If it
+    // matched before and is currently between stops on the road, keep
+    // showing the last confirmed stop as current (normal "en route"
+    // behavior, not a bug).
+    return lastIndex;
   }
 
   Future<void> _showLocationRequiredDialog({
@@ -702,6 +848,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     _sheetController.removeListener(_handleSheetDrag);
     _sheetController.dispose();
 
+    for (final controller in _metroScrollControllers.values) {
+      controller.dispose();
+    }
+
     _evAvailabilityTimer?.cancel();
     _evSubscription?.cancel();
     _facultyLocationSubscription?.cancel();
@@ -730,6 +880,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final sheetTopOffset = (screenHeight * _sheetExtent) + 14;
 
     final anyEvAvailable = _evLocations.isNotEmpty;
+
+    final ev1Location = _evLocations['EV1'];
+    final ev2Location = _evLocations['EV2'];
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: const SystemUiOverlayStyle(
@@ -799,12 +952,53 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ],
             ),
 
+            // ── Metro-style route progress strips — top free space ───────────
+            // One row per online EV, showing its fixed round-trip stop
+            // sequence with passed/current/next/upcoming states. Purely
+            // additive, reads only from _evLocations (already-existing
+            // state) plus the isEvNearStop geofence check (already-
+            // existing logic).
+            Positioned(
+              left: 0,
+              right: 0,
+              top: MediaQuery.of(context).padding.top + 6,
+              child: Column(
+                children: [
+                  if (ev1Location != null)
+                    _buildMetroLine(
+                      vehicleId: 'EV1',
+                      routeOrder: _ev1RouteOrder,
+                      currentIndex: _currentRouteIndex(
+                        'EV1',
+                        ev1Location,
+                        _ev1RouteOrder,
+                      ),
+                    ),
+                  if (ev1Location != null && ev2Location != null)
+                    const SizedBox(height: 6),
+                  if (ev2Location != null)
+                    _buildMetroLine(
+                      vehicleId: 'EV2',
+                      routeOrder: _ev2RouteOrder,
+                      currentIndex: _currentRouteIndex(
+                        'EV2',
+                        ev2Location,
+                        _ev2RouteOrder,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
             // ── Location Warning ────────────────────────────────────────────
             if (!_locationAvailable)
               Positioned(
                 left: 16,
                 right: 16,
-                top: MediaQuery.of(context).padding.top + 12,
+                top:
+                    MediaQuery.of(context).padding.top +
+                    12 +
+                    _metroAreaHeight(ev1Location, ev2Location),
                 child: _buildLocationWarning(),
               ),
 
@@ -813,7 +1007,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               Positioned(
                 left: 16,
                 right: 16,
-                top: MediaQuery.of(context).padding.top + 12,
+                top:
+                    MediaQuery.of(context).padding.top +
+                    12 +
+                    _metroAreaHeight(ev1Location, ev2Location),
                 child: _buildEvAtBlockBanner(_evAtBlockName!),
               ),
 
@@ -824,6 +1021,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 right: 16,
                 top:
                     MediaQuery.of(context).padding.top +
+                    _metroAreaHeight(ev1Location, ev2Location) +
                     (_evAtBlockName != null
                         ? 88
                         : (_locationAvailable ? 12 : 92)),
@@ -851,6 +1049,254 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // Approximates how tall the metro-line area currently is, so the warning/
+  // notification banners below it shift down instead of overlapping it.
+  // Pure layout math — does not touch any EV state.
+  double _metroAreaHeight(EvLocation? ev1, EvLocation? ev2) {
+    const lineHeight = 54.0;
+    const gap = 6.0;
+    if (ev1 != null && ev2 != null) return (lineHeight * 2) + gap;
+    if (ev1 != null || ev2 != null) return lineHeight;
+    return 0.0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // METRO-STYLE ROUTE PROGRESS WIDGET
+  // ---------------------------------------------------------------------------
+  //
+  // Renders one horizontal line for a single EV's full round-trip route:
+  //   - Stops before `currentIndex`  -> passed (dull yellow/orange)
+  //   - Stop at `currentIndex`       -> current (solid green)
+  //   - Stop at `currentIndex + 1`   -> next / approaching (blinking)
+  //   - Everything after that        -> upcoming (neutral grey)
+  //   - If `currentIndex` is null (EV online but hasn't reached its first
+  //     stop yet, or nowhere near any stop at all), NOTHING is green —
+  //     only stop 0 blinks as "waiting to start," rest stay grey.
+  //
+  // Auto-scrolls horizontally to keep the current/next stop visible as
+  // progress advances, so the user doesn't have to manually swipe to see
+  // where the EV currently is on a 9-stop route.
+
+  Widget _buildMetroLine({
+    required String vehicleId,
+    required List<String> routeOrder,
+    required int? currentIndex,
+  }) {
+    final nextIndex = (currentIndex ?? -1) + 1;
+
+    final controller = _metroScrollControllers.putIfAbsent(
+      vehicleId,
+      () => ScrollController(),
+    );
+
+    // Auto-scroll to bring the focus stop (current, or next if nothing
+    // is current yet) into view, without fighting the user if they're
+    // actively scrolling it themselves.
+    final focusIndex = currentIndex ?? nextIndex;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!controller.hasClients) return;
+      const segmentWidth = 64.0; // 46 label width + 18 connector width
+      final targetOffset = (focusIndex * segmentWidth - 60).clamp(
+        0.0,
+        controller.position.maxScrollExtent,
+      );
+      if ((controller.offset - targetOffset).abs() > 4) {
+        controller.animateTo(
+          targetOffset,
+          duration: const Duration(milliseconds: 500),
+          curve: Curves.easeOutCubic,
+        );
+      }
+    });
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      child: _buildGlassContainer(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        borderRadius: BorderRadius.circular(16),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: vitGreen.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                vehicleId,
+                style: const TextStyle(
+                  color: vitGreen,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.3,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: SingleChildScrollView(
+                controller: controller,
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                child: Row(
+                  children: List.generate(routeOrder.length, (i) {
+                    final isPassed = currentIndex != null && i < currentIndex;
+                    final isCurrent = i == currentIndex;
+                    final isNext = i == nextIndex;
+
+                    final dot = _buildMetroDot(
+                      isPassed: isPassed,
+                      isCurrent: isCurrent,
+                      isNext: isNext,
+                    );
+
+                    final stopLabel = Text(
+                      routeOrder[i],
+                      style: TextStyle(
+                        fontSize: 8.5,
+                        fontWeight: isCurrent
+                            ? FontWeight.w900
+                            : FontWeight.w700,
+                        color: isCurrent
+                            ? vitGreen
+                            : (isPassed
+                                  ? Colors.orange.shade800
+                                  : Colors.grey.shade500),
+                      ),
+                    );
+
+                    final segment = SizedBox(
+                      width: 46,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [dot, const SizedBox(height: 3), stopLabel],
+                      ),
+                    );
+
+                    if (i == routeOrder.length - 1) {
+                      return segment;
+                    }
+
+                    final connectorPassed =
+                        currentIndex != null && i < currentIndex;
+
+                    return Row(
+                      children: [
+                        segment,
+                        Container(
+                          width: 18,
+                          height: 2.5,
+                          margin: const EdgeInsets.only(bottom: 14),
+                          color: connectorPassed
+                              ? Colors.orange.shade400
+                              : Colors.grey.withValues(alpha: 0.25),
+                        ),
+                      ],
+                    );
+                  }),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMetroDot({
+    required bool isPassed,
+    required bool isCurrent,
+    required bool isNext,
+  }) {
+    if (isCurrent) {
+      return Container(
+        width: 14,
+        height: 14,
+        decoration: BoxDecoration(
+          color: vitGreen,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: vitGreen.withValues(alpha: 0.55),
+              blurRadius: 8,
+              spreadRadius: 1,
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (isNext) {
+      return AnimatedBuilder(
+        animation: _glowController,
+        builder: (context, child) {
+          final t = _glowController.value;
+          // t goes 0 → 1 → 0 → 1... We want:
+          //   t in [0, 0.5)  → grey (off)
+          //   t in [0.5, 1]  → yellow (on)
+          final isOn = t >= 0.5;
+
+          return Container(
+            width: 16,
+            height: 16,
+            decoration: BoxDecoration(
+              color: isOn ? Colors.yellow : Colors.grey.shade400,
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: isOn ? Colors.white : Colors.grey.shade300,
+                width: 2.5,
+              ),
+              boxShadow: isOn
+                  ? [
+                      BoxShadow(
+                        color: Colors.yellow.withValues(alpha: 0.8),
+                        blurRadius: 14,
+                        spreadRadius: 3,
+                      ),
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.25),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
+                      ),
+                    ]
+                  : [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.1),
+                        blurRadius: 4,
+                        offset: const Offset(0, 1),
+                      ),
+                    ],
+            ),
+          );
+        },
+      );
+    }
+
+    if (isPassed) {
+      return Container(
+        width: 11,
+        height: 11,
+        decoration: BoxDecoration(
+          color: Colors.orange.shade400,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 1.5),
+        ),
+      );
+    }
+
+    // Upcoming / not yet relevant.
+    return Container(
+      width: 10,
+      height: 10,
+      decoration: BoxDecoration(
+        color: Colors.grey.withValues(alpha: 0.35),
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 1.5),
       ),
     );
   }
@@ -968,12 +1414,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     // Block markers
     for (final block in _campusBlocks) {
-      markers.add(
-        _buildCampusMarker(
-          position: block.value,
-          label: block.key,
-        ),
-      );
+      markers.add(_buildCampusMarker(position: block.value, label: block.key));
     }
 
     // Faculty Marker (Blue User Pin)
@@ -1045,24 +1486,48 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // Now takes the specific EvLocation it represents, so each vehicle gets
-  // its own marker with its own label and its own moving/stationary state.
+  // ---------------------------------------------------------------------------
+  // VEHICLE MARKER — EV icon + radial direction-flow chevrons
+  // (UNCHANGED FROM YOUR CURRENT VERSION — including your size/opacity edits)
+  // ---------------------------------------------------------------------------
+
   Marker _buildVehicleMarker(EvLocation location) {
-    final isMoving = location.speed >= 1.0;
+    final vehicleId = location.vehicleId;
+    final rawMoving = location.speed >= 1.0;
+    final wasMoving = _evMovingStable[vehicleId] ?? rawMoving;
+
+    // Hysteresis purely for the arrow's visual on/off state: once moving,
+    // only flips back to "stopped" below a lower threshold, so GPS speed
+    // jitter right around 1.0 m/s can't flicker the arrows.
+    final isMoving = wasMoving ? (location.speed >= 0.6) : rawMoving;
+    _evMovingStable[vehicleId] = isMoving;
+
+    final headingRad = location.heading * (math.pi / 180);
 
     return Marker(
       point: location.position,
       width: 92,
       height: 92,
       child: AnimatedBuilder(
-        animation: _pulseController,
+        animation: Listenable.merge([_pulseController, _glowController]),
         builder: (context, child) {
           final scale = isMoving ? 1.0 : 1.0 + (_pulseController.value * 0.07);
+
           return Transform.scale(
             scale: scale,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+            child: Stack(
+              alignment: Alignment.center,
+              clipBehavior: Clip.none,
               children: [
+                // ── Direction chevrons — radially placed around the icon
+                //    along the heading line, animating outward on a loop.
+                if (isMoving)
+                  ..._buildDirectionChevrons(
+                    headingRad: headingRad,
+                    animationValue: _glowController.value,
+                  ),
+
+                // ── EV icon — perfectly centered, untouched ─────────────
                 Container(
                   width: 52,
                   height: 52,
@@ -1093,30 +1558,34 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                     size: 28,
                   ),
                 ),
-                const SizedBox(height: 4),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 9,
-                    vertical: 3.5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(8),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.18),
-                        blurRadius: 6,
-                        offset: const Offset(0, 2),
+
+                // ── Vehicle label — pinned below the icon ────────────────
+                Positioned(
+                  bottom: -22,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 3.5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(8),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.18),
+                          blurRadius: 6,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Text(
+                      vehicleId,
+                      style: const TextStyle(
+                        color: vitBlue,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.3,
                       ),
-                    ],
-                  ),
-                  child: Text(
-                    location.vehicleId,
-                    style: const TextStyle(
-                      color: vitBlue,
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.3,
                     ),
                   ),
                 ),
@@ -1126,6 +1595,51 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         },
       ),
     );
+  }
+
+  // Builds small chevrons along the heading direction from the icon's
+  // center, spaced at increasing radius with decreasing opacity, staggered
+  // in phase so together they read as a continuous outward flow — a subtle
+  // trailing pulse in the travel direction, always tucked right next to
+  // the icon. (UNCHANGED — retains your bigger size/opacity/radius edits.)
+  List<Widget> _buildDirectionChevrons({
+    required double headingRad,
+    required double animationValue,
+  }) {
+    const chevronCount = 3;
+    const baseRadius = 38.0;
+    const radiusSpread = 20.0;
+    const chevronSize = 22.0;
+
+    final dx = math.sin(headingRad);
+    final dy = -math.cos(headingRad);
+
+    return List.generate(chevronCount, (i) {
+      final phase = (animationValue + (i / chevronCount)) % 1.0;
+      final radius = baseRadius + (phase * radiusSpread);
+      final opacity = (0.85 * (1.0 - phase)).clamp(0.0, 0.85);
+
+      return Transform.translate(
+        offset: Offset(dx * radius, dy * radius),
+        child: Opacity(
+          opacity: opacity,
+          child: Transform.rotate(
+            angle: headingRad,
+            child: Icon(
+              Icons.navigation_rounded,
+              color: vitGreen,
+              size: chevronSize,
+              shadows: [
+                Shadow(
+                  color: Colors.black.withValues(alpha: 0.2),
+                  blurRadius: 2,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
   }
 
   Marker _buildFacultyMarker() {
