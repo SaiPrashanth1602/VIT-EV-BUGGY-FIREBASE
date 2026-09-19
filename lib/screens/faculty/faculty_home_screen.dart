@@ -29,14 +29,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   static const Map<String, List<int>> _ev1OutboundByBlock = {
     'AB1': [468, 523, 578, 633, 688, 743, 828, 883, 938],
     'AB3': [470, 525, 580, 635, 690, 745, 830, 885, 940],
-    'AB2-4': [472, 527, 582, 637, 692, 747, 832, 887, 942],
+    'AB2, AB4 Junction': [472, 527, 582, 637, 692, 747, 832, 887, 942],
     'MAB3': [475, 530, 585, 640, 695, 750, 835, 890, 945],
     'MAB4': [475, 530, 585, 640, 695, 750, 835, 890, 945],
   };
 
   static const Map<String, List<int>> _ev2OutboundByBlock = {
     'AB3': [473, 527, 583, 637, 693, 747, 833, 887, 943],
-    'AB2-4': [475, 529, 585, 639, 695, 750, 835, 889, 945],
+    'AB2, AB4 Junction': [475, 529, 585, 639, 695, 750, 835, 889, 945],
     'MAB3': [477, 532, 587, 642, 707, 752, 837, 892, 947],
     'MAB4': [477, 532, 587, 642, 707, 752, 837, 892, 947],
     'AB5': [482, 537, 592, 647, 702, 757, 842, 898, 952],
@@ -45,7 +45,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   static const Map<String, List<int>> _ev1ReturnByBlock = {
     'MAB3': [540, 595, 650, 705, 760, 900, 955],
     'MAB4': [540, 595, 650, 705, 760, 900, 955],
-    'AB2-4': [543, 598, 653, 708, 763, 903, 958],
+    'AB2, AB4 Junction': [543, 598, 653, 708, 763, 903, 958],
     'AB3': [545, 600, 655, 710, 765, 905, 960],
     'AB1': [547, 602, 657, 712, 767, 907, 962],
   };
@@ -54,7 +54,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     'AB5': [538, 593, 648, 703, 758, 898, 953],
     'MAB3': [543, 598, 653, 708, 763, 903, 957],
     'MAB4': [543, 598, 653, 708, 763, 903, 957],
-    'AB2-4': [546, 601, 656, 711, 766, 906, 960],
+    'AB2, AB4 Junction': [546, 601, 656, 711, 766, 906, 960],
     'AB3': [548, 603, 658, 713, 768, 908, 962],
   };
 
@@ -69,24 +69,24 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   static const List<String> _ev1RouteOrder = [
     'AB1',
     'AB3',
-    'AB2-4',
+    'AB2, AB4 Junction',
     'MAB3',
     'MAB4', // turnaround
     'MAB3',
-    'AB2-4',
+    'AB2, AB4 Junction',
     'AB3',
     'AB1',
   ];
 
   static const List<String> _ev2RouteOrder = [
     'AB3',
-    'AB2-4',
+    'AB2, AB4 Junction',
     'MAB3',
     'MAB4',
     'AB5', // turnaround
     'MAB4',
     'MAB3',
-    'AB2-4',
+    'AB2, AB4 Junction',
     'AB3',
   ];
 
@@ -218,22 +218,36 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
   }
 
+  Future<void> _refreshEvStatus() async {
+    try {
+      final locations = await _evProvider.fetchCurrentLocations();
+      for (final location in locations) {
+        _handleEvLocation(location);
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Live EV status refreshed')));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Unable to refresh EV status')),
+      );
+    }
+  }
+
   Future<void> _initialize() async {
     await NotificationService.instance.initialize();
-
-    try {
-      await _evProvider.start();
-    } catch (_) {
-      // Firebase or platform services may be unavailable during setup.
-    }
 
     try {
       _evSubscription = _evProvider.locationStream.listen(
         _handleEvLocation,
         onError: (_) {},
       );
+
+      await _evProvider.start();
     } catch (_) {
-      // Ignore provider stream startup failures.
+      // Firebase or platform services may be unavailable during setup.
     }
 
     _startEvAvailabilityCheck();
@@ -552,7 +566,15 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         }
 
         final now = DateTime.now().toUtc();
+
         final activeIds = <String>{};
+
+        for (final loc in locations) {
+          if (now.difference(loc.timestamp).inSeconds <= 180) {
+            activeIds.add(loc.vehicleId);
+            _handleEvLocation(loc);
+          }
+        }
 
         for (final loc in locations) {
           if (now.difference(loc.timestamp).inSeconds <= 180) {
@@ -872,13 +894,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   @override
   Widget build(BuildContext context) {
     final facultyBlockName = _facultyBlockName ?? 'Not assigned';
-    final screenHeight = MediaQuery.of(context).size.height;
-
-    // How far above the bottom of the screen the sheet's visible top edge
-    // currently sits, in logical pixels — used to float the GPS button
-    // and pickup legend just above the sheet, moving with it as dragged.
-    final sheetTopOffset = (screenHeight * _sheetExtent) + 14;
-
     final anyEvAvailable = _evLocations.isNotEmpty;
 
     final ev1Location = _evLocations['EV1'];
@@ -1032,15 +1047,30 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             //     and rides up with it as the sheet is dragged ─────────────
             Positioned(
               left: 16,
-              bottom: sheetTopOffset,
+              top:
+                  MediaQuery.of(context).padding.top +
+                  12 +
+                  _metroAreaHeight(ev1Location, ev2Location) +
+                  8,
               child: _buildPickupLegend(),
             ),
 
             // ── Bottom-right: GPS recenter button — same behavior ────────────
             Positioned(
               right: 16,
-              bottom: sheetTopOffset,
-              child: _buildMapControl(),
+              top:
+                  MediaQuery.of(context).padding.top +
+                  12 +
+                  _metroAreaHeight(ev1Location, ev2Location) +
+                  8,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildRefreshControl(),
+                  const SizedBox(width: 8),
+                  _buildMapControl(),
+                ],
+              ),
             ),
 
             // ── Draggable Shuttle Schedule Sheet ─────────────────────────────
@@ -1184,22 +1214,63 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                     final connectorPassed =
                         currentIndex != null && i < currentIndex;
 
+                    final isActiveConnector =
+                        currentIndex != null && i == currentIndex;
                     return Row(
                       children: [
                         segment,
-                        Container(
-                          width: 18,
-                          height: 2.5,
-                          margin: const EdgeInsets.only(bottom: 14),
-                          color: connectorPassed
-                              ? Colors.orange.shade400
-                              : Colors.grey.withValues(alpha: 0.25),
+                        SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              Container(
+                                width: 18,
+                                height: 2.5,
+                                color: connectorPassed
+                                    ? Colors.orange.shade400
+                                    : Colors.grey.withValues(alpha: 0.25),
+                              ),
+                              if (isActiveConnector)
+                                AnimatedBuilder(
+                                  animation: _glowController,
+                                  builder: (context, child) {
+                                    return Align(
+                                      alignment: Alignment(
+                                        -0.65 + (_glowController.value * 1.3),
+                                        0,
+                                      ),
+                                      child: const Icon(
+                                        Icons.chevron_right_rounded,
+                                        size: 16,
+                                        color: vitGreen,
+                                      ),
+                                    );
+                                  },
+                                ),
+                            ],
+                          ),
                         ),
                       ],
                     );
                   }),
                 ),
               ),
+            ),
+            const SizedBox(width: 4),
+            AnimatedBuilder(
+              animation: _glowController,
+              builder: (context, child) {
+                return Transform.translate(
+                  offset: Offset((_glowController.value * 4) - 2, 0),
+                  child: const Icon(
+                    Icons.arrow_forward_rounded,
+                    color: vitGreen,
+                    size: 16,
+                  ),
+                );
+              },
             ),
           ],
         ),
@@ -1213,67 +1284,41 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     required bool isNext,
   }) {
     if (isCurrent) {
-      return Container(
-        width: 14,
-        height: 14,
-        decoration: BoxDecoration(
-          color: vitGreen,
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white, width: 2),
-          boxShadow: [
-            BoxShadow(
-              color: vitGreen.withValues(alpha: 0.55),
-              blurRadius: 8,
-              spreadRadius: 1,
-            ),
-          ],
-        ),
-      );
-    }
-
-    if (isNext) {
       return AnimatedBuilder(
         animation: _glowController,
         builder: (context, child) {
-          final t = _glowController.value;
-          // t goes 0 → 1 → 0 → 1... We want:
-          //   t in [0, 0.5)  → grey (off)
-          //   t in [0.5, 1]  → yellow (on)
-          final isOn = t >= 0.5;
-
+          final glow = 8.0 + (_glowController.value * 8.0);
+          final alpha = 0.35 + (_glowController.value * 0.30);
           return Container(
-            width: 16,
-            height: 16,
+            width: 15,
+            height: 15,
             decoration: BoxDecoration(
-              color: isOn ? Colors.yellow : Colors.grey.shade400,
+              color: vitGreen,
               shape: BoxShape.circle,
-              border: Border.all(
-                color: isOn ? Colors.white : Colors.grey.shade300,
-                width: 2.5,
-              ),
-              boxShadow: isOn
-                  ? [
-                      BoxShadow(
-                        color: Colors.yellow.withValues(alpha: 0.8),
-                        blurRadius: 14,
-                        spreadRadius: 3,
-                      ),
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.25),
-                        blurRadius: 6,
-                        offset: const Offset(0, 2),
-                      ),
-                    ]
-                  : [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.1),
-                        blurRadius: 4,
-                        offset: const Offset(0, 1),
-                      ),
-                    ],
+              border: Border.all(color: Colors.white, width: 2),
+              boxShadow: [
+                BoxShadow(
+                  color: vitGreen.withValues(alpha: alpha),
+                  blurRadius: glow,
+                  spreadRadius: 1.5,
+                ),
+              ],
             ),
           );
         },
+      );
+    }
+
+    // The next stop stays neutral; only the live EV position glows.
+    if (isNext) {
+      return Container(
+        width: 12,
+        height: 12,
+        decoration: BoxDecoration(
+          color: Colors.grey.shade400,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 1.5),
+        ),
       );
     }
 
@@ -1371,6 +1416,20 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildRefreshControl() {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: _refreshEvStatus,
+        child: _buildGlassContainer(
+          padding: const EdgeInsets.all(12),
+          child: const Icon(Icons.refresh_rounded, color: vitBlue, size: 22),
+        ),
       ),
     );
   }
@@ -1973,24 +2032,104 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  Widget _buildEvStatusCard(
+    String vehicleId,
+    EvLocation? location,
+    List<String> routeOrder,
+  ) {
+    final online = location != null;
+    final index = online
+        ? (_currentRouteIndex(vehicleId, location, routeOrder) ?? -1)
+        : -1;
+    final current = online && index >= 0 && index < routeOrder.length
+        ? routeOrder[index]
+        : '—';
+    final next = online && index >= 0 && index + 1 < routeOrder.length
+        ? routeOrder[index + 1]
+        : '—';
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: online
+            ? vitGreen.withValues(alpha: 0.07)
+            : Colors.grey.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: online
+              ? vitGreen.withValues(alpha: 0.25)
+              : Colors.grey.withValues(alpha: 0.18),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.electric_rickshaw_rounded,
+                size: 18,
+                color: online ? vitGreen : Colors.grey,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  vehicleId,
+                  style: const TextStyle(
+                    color: vitBlue,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  online ? 'ONLINE' : 'OFFLINE',
+                  style: TextStyle(
+                    color: online ? vitGreen : Colors.grey.shade600,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Current: $current',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: vitBlue,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            'Next: $next',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.grey.shade600,
+              fontSize: 10.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // BOTTOM DRAGGABLE CARD
   // ---------------------------------------------------------------------------
 
   Widget _buildPilotCard(String facultyBlockName, bool anyEvAvailable) {
-    final nextShuttle = _nextScheduledShuttle(facultyBlockName);
-    final upcoming = _upcomingSchedule(facultyBlockName);
-
-    // Lists which vehicles are currently online, e.g. "EV1, EV2 online"
-    // or "EV1 online" if only one is active.
-    final String evStatus;
-    if (!anyEvAvailable) {
-      evStatus = 'Waiting for live shuttle location';
-    } else {
-      final ids = _evLocations.keys.toList()..sort();
-      evStatus = '${ids.join(', ')} online';
-    }
-
     return DraggableScrollableSheet(
       controller: _sheetController,
       initialChildSize: _sheetMinSize,
@@ -2093,115 +2232,29 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       ],
                     ),
                   ),
-                  _buildStatusBadge(anyEvAvailable),
                 ],
               ),
 
               const SizedBox(height: 14),
-
-              Container(
-                padding: const EdgeInsets.fromLTRB(15, 13, 15, 13),
-                decoration: BoxDecoration(
-                  color: vitBlue.withValues(alpha: 0.045),
-                  borderRadius: BorderRadius.circular(17),
-                  border: Border.all(color: vitBlue.withValues(alpha: 0.10)),
-                ),
-                child: nextShuttle == null
-                    ? const Text(
-                        'No scheduled shuttle for this block.',
-                        style: TextStyle(
-                          color: vitBlue,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      )
-                    : Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 9,
-                              vertical: 6,
-                            ),
-                            decoration: BoxDecoration(
-                              color: vitGreen.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(9),
-                            ),
-                            child: Text(
-                              nextShuttle.vehicle,
-                              style: const TextStyle(
-                                color: vitGreen,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 11),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  'NEXT SCHEDULED SHUTTLE',
-                                  style: TextStyle(
-                                    color: vitBlue,
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: 0.45,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  nextShuttle.direction.isEmpty
-                                      ? '${nextShuttle.tomorrow ? 'TOMORROW • ' : ''}${_formatScheduleTime(nextShuttle.time)}'
-                                      : '${nextShuttle.tomorrow ? 'TOMORROW • ' : ''}${nextShuttle.direction} • ${_formatScheduleTime(nextShuttle.time)}',
-                                  style: TextStyle(
-                                    color: Colors.grey.shade600,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const Icon(
-                            Icons.chevron_right_rounded,
-                            color: vitBlue,
-                            size: 22,
-                          ),
-                        ],
-                      ),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildEvStatusCard(
+                      'EV1',
+                      _evLocations['EV1'],
+                      _ev1RouteOrder,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _buildEvStatusCard(
+                      'EV2',
+                      _evLocations['EV2'],
+                      _ev2RouteOrder,
+                    ),
+                  ),
+                ],
               ),
-
-              const SizedBox(height: 12),
-
-              _buildInfoRow(
-                icon: Icons.alt_route_rounded,
-                label: 'Live status',
-                value: evStatus,
-              ),
-
-              const SizedBox(height: 18),
-
-              const Text(
-                'TODAY’S SCHEDULE',
-                style: TextStyle(
-                  color: vitBlue,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 0.65,
-                ),
-              ),
-              const SizedBox(height: 8),
-
-              if (facultyBlockName == 'Not assigned')
-                _buildScheduleEmpty(
-                  'Move within a shuttle service area to see your block schedule.',
-                )
-              else if (upcoming.isEmpty)
-                _buildScheduleEmpty(
-                  'Today’s scheduled services have ended. The next service starts tomorrow.',
-                )
-              else
-                ...upcoming.map(_buildScheduleRow),
             ],
           ),
         );

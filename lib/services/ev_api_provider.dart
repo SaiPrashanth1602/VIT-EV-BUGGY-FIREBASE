@@ -30,63 +30,55 @@ class EvApiProvider implements EvLocationProvider {
 
     _started = true;
 
-    _databaseSubscription = _vehiclesReference.onValue.listen((event) {
-      if (!_started || _locationController.isClosed) {
-        return;
-      }
-
-      final data = event.snapshot.value;
-
-      if (data is! Map) {
-        return;
-      }
-
-      bool foundActiveVehicle = false;
-
-      for (final entry in data.entries) {
-        final vehicleId = entry.key.toString();
-        final vehicleData = entry.value;
-
-        if (vehicleData is! Map) {
-          continue;
+    _databaseSubscription = _vehiclesReference.onValue.listen(
+      (event) {
+        if (!_started || _locationController.isClosed) {
+          return;
         }
 
-        final active = vehicleData['active'] == true;
-        final isOnline = vehicleData['isOnline'] ?? true;
+        final data = event.snapshot.value;
 
-        // Skip vehicle if shift has ended or driver is offline
-        if (!active || !isOnline) {
-          continue;
+        if (data is! Map) {
+          return;
         }
 
-        final latitude = _toDouble(vehicleData['latitude']);
-        final longitude = _toDouble(vehicleData['longitude']);
+        bool foundActiveVehicle = false;
 
-        if (latitude == null || longitude == null) {
-          continue;
+        for (final entry in data.entries) {
+          final vehicleId = entry.key.toString();
+          final rawVehicleData = entry.value;
+
+          if (rawVehicleData is! Map) {
+            continue;
+          }
+
+          final vehicleData = Map<String, dynamic>.from(rawVehicleData);
+
+          // Only active and connected vehicles are displayed.
+          if (!_isVehicleActive(vehicleData) ||
+              !_isVehicleConnected(vehicleData)) {
+            continue;
+          }
+
+          final location = _createLocation(vehicleId, vehicleData);
+
+          if (location == null) {
+            continue;
+          }
+
+          foundActiveVehicle = true;
+          _locationController.add(location);
         }
 
-        final timestamp = _parseTimestamp(vehicleData['timestamp']);
-        final speed = _toDouble(vehicleData['speed']) ?? 0.0;
-        final heading = _toDouble(vehicleData['heading']) ?? 0.0;
-
-        final location = EvLocation(
-          vehicleId: vehicleId,
-          position: LatLng(latitude, longitude),
-          timestamp: timestamp,
-          speed: speed,
-          heading: heading,
-        );
-
-        foundActiveVehicle = true;
-        _locationController.add(location);
-      }
-
-      // If no active vehicles are broadcasting, query current locations to clear state
-      if (!foundActiveVehicle) {
-        fetchCurrentLocations();
-      }
-    });
+        // Triggers a fresh read when no active vehicle is found.
+        if (!foundActiveVehicle) {
+          unawaited(fetchCurrentLocations());
+        }
+      },
+      onError: (error) {
+        // Prevents Firebase stream errors from crashing the app.
+      },
+    );
   }
 
   @override
@@ -103,58 +95,81 @@ class EvApiProvider implements EvLocationProvider {
 
     for (final entry in data.entries) {
       final vehicleId = entry.key.toString();
-      final vehicleData = entry.value;
+      final rawVehicleData = entry.value;
 
-      if (vehicleData is! Map) {
+      if (rawVehicleData is! Map) {
         continue;
       }
 
-      final active = vehicleData['active'] == true;
-      final isOnline = vehicleData['isOnline'] ?? true;
+      final vehicleData = Map<String, dynamic>.from(rawVehicleData);
 
-      // Filter out vehicles that have ended shift or disconnected
-      if (!active || !isOnline) {
+      // Only active and connected vehicles are returned.
+      if (!_isVehicleActive(vehicleData) || !_isVehicleConnected(vehicleData)) {
         continue;
       }
 
-      final latitude = _toDouble(vehicleData['latitude']);
-      final longitude = _toDouble(vehicleData['longitude']);
+      final location = _createLocation(vehicleId, vehicleData);
 
-      if (latitude == null || longitude == null) {
+      if (location == null) {
         continue;
       }
 
-      final timestamp = _parseTimestamp(vehicleData['timestamp']);
-
-      locations.add(
-        EvLocation(
-          vehicleId: vehicleId,
-          position: LatLng(latitude, longitude),
-          timestamp: timestamp,
-          speed: _toDouble(vehicleData['speed']) ?? 0.0,
-          heading: _toDouble(vehicleData['heading']) ?? 0.0,
-        ),
-      );
+      locations.add(location);
     }
 
     return locations;
   }
 
-  @override
-  Future<void> stop() async {
-    if (!_started) {
-      return;
+  bool _isVehicleActive(Map<String, dynamic> data) {
+    final active = data['active'];
+
+    if (active is bool) {
+      return active;
     }
 
-    _started = false;
+    if (active is num) {
+      return active != 0;
+    }
 
-    await _databaseSubscription?.cancel();
-    _databaseSubscription = null;
+    return active?.toString().toLowerCase() == 'true';
   }
 
-  Future<void> dispose() async {
-    await stop();
-    await _locationController.close();
+  bool _isVehicleConnected(Map<String, dynamic> data) {
+    final connectionState = data['connectionState']
+        ?.toString()
+        .toUpperCase()
+        .trim();
+
+    return connectionState == 'CONNECTED';
+  }
+
+  EvLocation? _createLocation(
+    String vehicleId,
+    Map<String, dynamic> vehicleData,
+  ) {
+    final latitude = _toDouble(vehicleData['latitude'] ?? vehicleData['lat']);
+
+    final longitude = _toDouble(
+      vehicleData['longitude'] ?? vehicleData['lng'] ?? vehicleData['lon'],
+    );
+
+    if (latitude == null || longitude == null) {
+      return null;
+    }
+
+    final timestamp = _parseTimestamp(vehicleData['timestamp']);
+
+    final speed = _toDouble(vehicleData['speed']) ?? 0.0;
+
+    final heading = _toDouble(vehicleData['heading']) ?? 0.0;
+
+    return EvLocation(
+      vehicleId: vehicleId,
+      position: LatLng(latitude, longitude),
+      timestamp: timestamp,
+      speed: speed,
+      heading: heading,
+    );
   }
 
   double? _toDouble(dynamic value) {
@@ -169,5 +184,24 @@ class EvApiProvider implements EvLocationProvider {
     final parsed = DateTime.tryParse(value?.toString() ?? '');
 
     return parsed ?? DateTime.now().toUtc();
+  }
+
+  @override
+  Future<void> stop() async {
+    if (!_started) {
+      return;
+    }
+
+    _started = false;
+
+    await _databaseSubscription?.cancel();
+
+    _databaseSubscription = null;
+  }
+
+  Future<void> dispose() async {
+    await stop();
+
+    await _locationController.close();
   }
 }
