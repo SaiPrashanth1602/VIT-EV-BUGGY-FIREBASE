@@ -406,6 +406,7 @@ class LocationService {
         .update({
           'active': false,
           'status': 'ENDED',
+          'connectionState': 'DISCONNECTED',
           'updatedAt': DateTime.now().toUtc().toIso8601String(),
         })
         .timeout(networkTimeout);
@@ -445,7 +446,10 @@ class LocationService {
     await _vehiclesReference.child(vehicleId).update({
       'vehicleId': vehicleId,
       'status': status,
-      'active': status == 'STARTED',
+
+      // Active for STARTED and other non-ended states.
+      'active': status != 'ENDED',
+
       'driverId': status == 'ENDED' ? null : currentDriverId,
       'lastSeen': timestamp,
       'connectionState': status == 'ENDED' ? 'DISCONNECTED' : 'CONNECTED',
