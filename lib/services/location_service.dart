@@ -15,8 +15,10 @@ class LocationService {
   String? get lastErrorMessage => _lastErrorMessage;
   Position? _lastValidPosition;
   Timer? _heartbeatTimer;
+  Timer? _shiftExpiryTimer;
   StreamSubscription<DatabaseEvent>? _connectionSubscription;
   void Function(bool connected)? onConnectionChanged;
+  void Function()? onShiftAutoEnded;
 
   static const String _deviceIdKey = 'ev_shuttle_driver_device_id';
   String? _resolvedDriverId;
@@ -35,6 +37,7 @@ class LocationService {
   }
 
   static const Duration heartbeatInterval = Duration(seconds: 30);
+  static const Duration maximumShiftDuration = Duration(minutes: 30);
   static const Duration networkTimeout = Duration(seconds: 8);
 
   bool get isTracking => _isTracking;
@@ -176,6 +179,7 @@ class LocationService {
       }
 
       await _registerDisconnectHandler(_vehicleId!);
+      await _scheduleShiftExpiry(_vehicleId!);
       _startConnectionMonitor();
       _startHeartbeat();
 
@@ -321,6 +325,34 @@ class LocationService {
         );
   }
 
+  Future<void> _scheduleShiftExpiry(String vehicleId) async {
+    _shiftExpiryTimer?.cancel();
+
+    final snapshot = await _vehiclesReference.child(vehicleId).get();
+    if (!snapshot.exists || snapshot.value is! Map) return;
+
+    final data = Map<String, dynamic>.from(snapshot.value as Map);
+    final startedAtText = data['shiftStartedAt']?.toString();
+    final startedAt = DateTime.tryParse(startedAtText ?? '')?.toUtc();
+    if (startedAt == null) return;
+
+    final expiryTime = startedAt.add(maximumShiftDuration);
+    final remaining = expiryTime.difference(DateTime.now().toUtc());
+
+    if (remaining <= Duration.zero) {
+      await stopTracking();
+      onShiftAutoEnded?.call();
+      return;
+    }
+
+    _shiftExpiryTimer = Timer(remaining, () async {
+      if (!_isTracking || _vehicleId != vehicleId) return;
+      print('30-MINUTE SHIFT LIMIT REACHED. ENDING SHIFT.');
+      await stopTracking();
+      onShiftAutoEnded?.call();
+    });
+  }
+
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) async {
@@ -385,6 +417,8 @@ class LocationService {
     _positionSubscription = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
+    _shiftExpiryTimer?.cancel();
+    _shiftExpiryTimer = null;
     _isTracking = false;
     _vehicleId = null;
     _lastValidPosition = null;

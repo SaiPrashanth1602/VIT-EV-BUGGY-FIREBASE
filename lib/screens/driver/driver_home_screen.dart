@@ -35,6 +35,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   void initState() {
     super.initState();
     _locationService.onConnectionChanged = _handleConnectionChanged;
+    _locationService.onShiftAutoEnded = _handleShiftAutoEnded;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _restoreExistingShift();
     });
@@ -54,6 +55,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   void dispose() {
     _clockTimer?.cancel();
     _locationService.onConnectionChanged = null;
+    _locationService.onShiftAutoEnded = null;
     super.dispose();
   }
 
@@ -186,8 +188,18 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
   }
 
-  bool _networkWarningShown = false;
   bool _isNetworkConnected = true;
+
+  void _handleShiftAutoEnded() {
+    if (!mounted) return;
+    setState(() {
+      _shiftActive = false;
+      _activeVehicleId = null;
+      _selectedVehicleId = null;
+      _isProcessing = false;
+    });
+    _showMessage('Your shift ended automatically after 30 minutes.');
+  }
 
   void _handleConnectionChanged(bool connected) {
     if (!mounted) return;
@@ -196,7 +208,6 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 
     setState(() {
       _isNetworkConnected = connected;
-      _networkWarningShown = !connected;
     });
 
     if (_shiftActive && connected && wasDisconnected) {
