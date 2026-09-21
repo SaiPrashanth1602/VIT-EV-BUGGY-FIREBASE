@@ -1,0 +1,9 @@
+[33mcommit 0c3cc32a5bf7be64dc247f6e7641fa3341aab529[m
+Author: Sai Prashanth <saiprashanth.m.ramesh@gmail.com>
+Date:   Sat Sep 19 13:45:45 2026 +0530
+
+    addressed the ev sync problem from driver side 2
+
+ lib/screens/driver/driver_home_screen.dart | 15 [32m+++++++++++[m[31m--[m
+ lib/services/location_service.dart         | 34 [32m++++++++++++++++++++++++++++++[m
+ 2 files changed, 47 insertions(+), 2 deletions(-)
