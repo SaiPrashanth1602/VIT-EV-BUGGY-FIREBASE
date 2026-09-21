@@ -6,6 +6,6 @@ void main() {
     await tester.pumpWidget(const VitEvBuggyApp());
 
     expect(find.text('VIT EV BUGGY'), findsOneWidget);
-    expect(find.text('Driver'), findsOneWidget);
+    expect(find.text('Welcome, Driver'), findsOneWidget);
   });
 }

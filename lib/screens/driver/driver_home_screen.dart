@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 
 import '../../services/location_service.dart';
@@ -60,6 +61,10 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   }
 
   Future<void> _restoreExistingShift() async {
+    if (Firebase.apps.isEmpty) {
+      return;
+    }
+
     try {
       String? vehicleId;
 

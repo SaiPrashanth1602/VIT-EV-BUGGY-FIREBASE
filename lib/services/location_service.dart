@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -50,9 +52,68 @@ class LocationService {
   static const double minMovementThreshold = 3.0;
   static const double maxBuggySpeedMetersPerSecond = 12.0;
 
-  final DatabaseReference _vehiclesReference = FirebaseDatabase.instance.ref(
-    'evShuttle/vehicles',
-  );
+  FirebaseDatabase? _databaseInstance;
+
+  FirebaseDatabase get _database {
+    final app = Firebase.apps.isNotEmpty ? Firebase.app() : null;
+    if (app == null) {
+      throw FirebaseException(
+        plugin: 'firebase_database',
+        code: 'no-app',
+        message: 'Firebase has not been initialized for this app instance.',
+      );
+    }
+
+    _databaseInstance ??= FirebaseDatabase.instanceFor(
+      app: app,
+      databaseURL:
+          'https://vit-ev-buggy-demo-default-rtdb.asia-southeast1.firebasedatabase.app',
+    );
+
+    return _databaseInstance!;
+  }
+
+  DatabaseReference get _vehiclesReference =>
+      _database.ref('evShuttle/vehicles');
+
+  Future<bool> _isRealtimeDatabaseConnected() async {
+    if (Firebase.apps.isEmpty) {
+      return false;
+    }
+
+    try {
+      final snapshot = await _database
+          .ref('.info/connected')
+          .get()
+          .timeout(const Duration(seconds: 2));
+      return snapshot.value == true || snapshot.value == null;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  Future<DataSnapshot?> _safeReadSnapshot(
+    DatabaseReference reference, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    if (Firebase.apps.isEmpty) {
+      return null;
+    }
+
+    try {
+      return await reference.get().timeout(timeout);
+    } catch (error) {
+      try {
+        final event = await reference.once().timeout(
+          const Duration(seconds: 2),
+        );
+        return event.snapshot;
+      } catch (_) {
+        debugPrint('RTDB READ FAILED FOR ${reference.path}: $error');
+        return null;
+      }
+    }
+  }
 
   Future<bool> checkAndRequestPermission() async {
     _lastErrorMessage = null;
@@ -305,7 +366,7 @@ class LocationService {
 
   void _startConnectionMonitor() {
     _connectionSubscription?.cancel();
-    _connectionSubscription = FirebaseDatabase.instance
+    _connectionSubscription = _database
         .ref('.info/connected')
         .onValue
         .listen(
@@ -328,8 +389,11 @@ class LocationService {
   Future<void> _scheduleShiftExpiry(String vehicleId) async {
     _shiftExpiryTimer?.cancel();
 
-    final snapshot = await _vehiclesReference.child(vehicleId).get();
-    if (!snapshot.exists || snapshot.value is! Map) return;
+    final snapshot = await _safeReadSnapshot(
+      _vehiclesReference.child(vehicleId),
+      timeout: const Duration(seconds: 3),
+    );
+    if (snapshot == null || !snapshot.exists || snapshot.value is! Map) return;
 
     final data = Map<String, dynamic>.from(snapshot.value as Map);
     final startedAtText = data['shiftStartedAt']?.toString();
@@ -378,11 +442,13 @@ class LocationService {
   Future<String?> findExistingShift() async {
     final currentDriverId = await _getDriverId();
     for (final vehicleId in vehicleIds) {
-      final snapshot = await _vehiclesReference
-          .child(vehicleId)
-          .get()
-          .timeout(networkTimeout);
-      if (!snapshot.exists || snapshot.value is! Map) continue;
+      final snapshot = await _safeReadSnapshot(
+        _vehiclesReference.child(vehicleId),
+        timeout: const Duration(seconds: 3),
+      );
+      if (snapshot == null || !snapshot.exists || snapshot.value is! Map) {
+        continue;
+      }
 
       final data = Map<String, dynamic>.from(snapshot.value as Map);
       final active = data['active'] == true;
@@ -490,7 +556,7 @@ class LocationService {
       'updatedAt': timestamp,
     });
 
-    await FirebaseDatabase.instance.ref('evShuttle/shiftEvents').push().set({
+    await _database.ref('evShuttle/shiftEvents').push().set({
       'vehicleId': vehicleId,
       'status': status,
       'timestamp': timestamp,
