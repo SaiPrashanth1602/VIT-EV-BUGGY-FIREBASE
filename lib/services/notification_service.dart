@@ -54,7 +54,7 @@ class NotificationService {
     await _plugin.show(
       arrivalNotificationId,
       'EV ARRIVAL',
-      'EV1 is arriving at $blockName',
+      'EV has arrived at your $blockName pickup point',
       details,
     );
   }

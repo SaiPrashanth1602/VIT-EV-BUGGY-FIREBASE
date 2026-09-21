@@ -400,10 +400,11 @@ class EvTrackingService {
 
   /// Checks if EV buggy has arrived within trigger distance of a stop
   bool isEvNearStop(LatLng evPosition, CampusStop stop) {
-    final distanceToBlock = distanceBetween(evPosition, stop.blockPosition);
+    // Arrival/glow logic must use ONLY the actual pickup point.
+    // The building/block coordinate is used for faculty eligibility and
+    // must never make a stop glow when the EV is still elsewhere.
     final distanceToPickup = distanceBetween(evPosition, stop.pickupPosition);
 
-    return distanceToBlock <= evTriggerRadiusMeters ||
-        distanceToPickup <= evTriggerRadiusMeters;
+    return distanceToPickup <= evTriggerRadiusMeters;
   }
 }
