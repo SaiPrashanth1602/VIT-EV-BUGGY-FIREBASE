@@ -24,152 +24,157 @@ class EvApiProvider implements EvLocationProvider {
 
   @override
   Future<void> start() async {
-    if (_started) {
-      return;
-    }
+    if (_started) return;
 
     _started = true;
 
-    _databaseSubscription = _vehiclesReference.onValue.listen(
-      (event) {
-        if (!_started || _locationController.isClosed) {
-          return;
-        }
+    try {
+      // Listen for real-time updates
+      _databaseSubscription = _vehiclesReference.onValue.listen(
+        (event) {
+          if (!_started || _locationController.isClosed) return;
 
-        final data = event.snapshot.value;
+          final locations = _parseLocations(event.snapshot.value);
 
-        if (data is! Map) {
-          return;
-        }
-
-        bool foundActiveVehicle = false;
-
-        for (final entry in data.entries) {
-          final vehicleId = entry.key.toString();
-          final rawVehicleData = entry.value;
-
-          if (rawVehicleData is! Map) {
-            continue;
+          for (final location in locations) {
+            _locationController.add(location);
           }
 
-          final vehicleData = Map<String, dynamic>.from(rawVehicleData);
+          print(
+            '📡 FACULTY RECEIVED ${locations.length} ACTIVE EV LOCATION(S)',
+          );
+        },
+        onError: (error) {
+          print('❌ FIREBASE EV STREAM ERROR: $error');
+        },
+      );
 
-          // Only active and connected vehicles are displayed.
-          if (!_isVehicleActive(vehicleData) ||
-              !_isVehicleConnected(vehicleData)) {
-            continue;
-          }
+      // Fetch current locations immediately
+      final snapshot = await _vehiclesReference.get();
 
-          final location = _createLocation(vehicleId, vehicleData);
+      if (!_started || _locationController.isClosed) return;
 
-          if (location == null) {
-            continue;
-          }
+      final locations = _parseLocations(snapshot.value);
 
-          foundActiveVehicle = true;
-          _locationController.add(location);
-        }
+      for (final location in locations) {
+        _locationController.add(location);
+      }
 
-        // Triggers a fresh read when no active vehicle is found.
-        if (!foundActiveVehicle) {
-          unawaited(fetchCurrentLocations());
-        }
-      },
-      onError: (error) {
-        // Prevents Firebase stream errors from crashing the app.
-      },
-    );
+      print('✅ INITIAL EV FETCH: ${locations.length} ACTIVE EV LOCATION(S)');
+    } catch (error) {
+      print('❌ EV PROVIDER START ERROR: $error');
+    }
   }
 
   @override
   Future<List<EvLocation>> fetchCurrentLocations() async {
-    final snapshot = await _vehiclesReference.get();
+    try {
+      final snapshot = await _vehiclesReference.get();
 
-    final data = snapshot.value;
+      final locations = _parseLocations(snapshot.value);
 
-    if (data is! Map) {
+      locations.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
+      return locations;
+    } catch (error) {
+      print('❌ FETCH CURRENT EV LOCATIONS ERROR: $error');
       return [];
     }
+  }
 
+  List<EvLocation> _parseLocations(dynamic data) {
     final locations = <EvLocation>[];
+
+    if (data is! Map) {
+      return locations;
+    }
 
     for (final entry in data.entries) {
       final vehicleId = entry.key.toString();
-      final rawVehicleData = entry.value;
+      final vehicleData = entry.value;
 
-      if (rawVehicleData is! Map) {
+      if (vehicleData is! Map) {
         continue;
       }
 
-      final vehicleData = Map<String, dynamic>.from(rawVehicleData);
+      final active = vehicleData['active'] == true;
 
-      // Only active and connected vehicles are returned.
-      if (!_isVehicleActive(vehicleData) || !_isVehicleConnected(vehicleData)) {
+      final connectionState = vehicleData['connectionState']
+          ?.toString()
+          .toUpperCase()
+          .trim();
+
+      final isOnline = vehicleData['isOnline'] == true;
+
+      // Accept the driver's current connectionState field.
+      // Also support isOnline for backward compatibility.
+      final online = connectionState == 'CONNECTED' || isOnline;
+
+      if (!active || !online) {
+        print(
+          '⏭️ SKIPPING $vehicleId | active=$active | '
+          'connectionState=$connectionState | isOnline=$isOnline',
+        );
         continue;
       }
 
-      final location = _createLocation(vehicleId, vehicleData);
+      final latitude = _toDouble(vehicleData['latitude'] ?? vehicleData['lat']);
 
-      if (location == null) {
+      final longitude = _toDouble(
+        vehicleData['longitude'] ?? vehicleData['lng'] ?? vehicleData['lon'],
+      );
+
+      if (latitude == null || longitude == null) {
+        print('⚠️ INVALID LOCATION FOR $vehicleId');
         continue;
       }
 
-      locations.add(location);
+      final timestamp = _parseTimestamp(
+        vehicleData['timestamp'] ??
+            vehicleData['lastUpdated'] ??
+            vehicleData['updatedAt'],
+      );
+
+      final speed = _toDouble(vehicleData['speed']) ?? 0.0;
+
+      final heading = _toDouble(vehicleData['heading']) ?? 0.0;
+
+      locations.add(
+        EvLocation(
+          vehicleId: vehicleId,
+          position: LatLng(latitude, longitude),
+          timestamp: timestamp,
+          speed: speed,
+          heading: heading,
+        ),
+      );
+
+      print(
+        '✅ EV LOCATION PARSED: $vehicleId | '
+        '$latitude, $longitude | $connectionState',
+      );
     }
 
     return locations;
   }
 
-  bool _isVehicleActive(Map<String, dynamic> data) {
-    final active = data['active'];
+  @override
+  Future<void> stop() async {
+    if (!_started) return;
 
-    if (active is bool) {
-      return active;
-    }
+    _started = false;
 
-    if (active is num) {
-      return active != 0;
-    }
+    await _databaseSubscription?.cancel();
 
-    return active?.toString().toLowerCase() == 'true';
+    _databaseSubscription = null;
+
+    print('🛑 EV PROVIDER STOPPED');
   }
 
-  bool _isVehicleConnected(Map<String, dynamic> data) {
-    final connectionState = data['connectionState']
-        ?.toString()
-        .toUpperCase()
-        .trim();
+  Future<void> dispose() async {
+    await stop();
 
-    return connectionState == 'CONNECTED';
-  }
-
-  EvLocation? _createLocation(
-    String vehicleId,
-    Map<String, dynamic> vehicleData,
-  ) {
-    final latitude = _toDouble(vehicleData['latitude'] ?? vehicleData['lat']);
-
-    final longitude = _toDouble(
-      vehicleData['longitude'] ?? vehicleData['lng'] ?? vehicleData['lon'],
-    );
-
-    if (latitude == null || longitude == null) {
-      return null;
-    }
-
-    final timestamp = _parseTimestamp(vehicleData['timestamp']);
-
-    final speed = _toDouble(vehicleData['speed']) ?? 0.0;
-
-    final heading = _toDouble(vehicleData['heading']) ?? 0.0;
-
-    return EvLocation(
-      vehicleId: vehicleId,
-      position: LatLng(latitude, longitude),
-      timestamp: timestamp,
-      speed: speed,
-      heading: heading,
-    );
+    await _locationController.close();
   }
 
   double? _toDouble(dynamic value) {
@@ -181,27 +186,16 @@ class EvApiProvider implements EvLocationProvider {
   }
 
   DateTime _parseTimestamp(dynamic value) {
-    final parsed = DateTime.tryParse(value?.toString() ?? '');
+    if (value is num) {
+      final raw = value.toInt();
 
-    return parsed ?? DateTime.now().toUtc();
-  }
+      final milliseconds = raw < 100000000000 ? raw * 1000 : raw;
 
-  @override
-  Future<void> stop() async {
-    if (!_started) {
-      return;
+      return DateTime.fromMillisecondsSinceEpoch(milliseconds, isUtc: true);
     }
 
-    _started = false;
+    final parsed = DateTime.tryParse(value?.toString() ?? '');
 
-    await _databaseSubscription?.cancel();
-
-    _databaseSubscription = null;
-  }
-
-  Future<void> dispose() async {
-    await stop();
-
-    await _locationController.close();
+    return parsed?.toUtc() ?? DateTime.now().toUtc();
   }
 }

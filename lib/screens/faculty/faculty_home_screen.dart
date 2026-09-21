@@ -240,22 +240,28 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     await NotificationService.instance.initialize();
 
     try {
+      // IMPORTANT:
+      // Subscribe BEFORE starting the provider.
       _evSubscription = _evProvider.locationStream.listen(
         _handleEvLocation,
-        onError: (_) {},
+        onError: (error) {
+          debugPrint('❌ FACULTY EV STREAM ERROR: $error');
+        },
       );
 
       await _evProvider.start();
-    } catch (_) {
-      // Firebase or platform services may be unavailable during setup.
+    } catch (error, stackTrace) {
+      debugPrint('❌ EV PROVIDER START ERROR: $error');
+      debugPrint('$stackTrace');
     }
 
     _startEvAvailabilityCheck();
 
     try {
       await _startFacultyLocation();
-    } catch (_) {
-      // Ignore location platform failures during startup.
+    } catch (error, stackTrace) {
+      debugPrint('❌ FACULTY LOCATION ERROR: $error');
+      debugPrint('$stackTrace');
     }
   }
 
