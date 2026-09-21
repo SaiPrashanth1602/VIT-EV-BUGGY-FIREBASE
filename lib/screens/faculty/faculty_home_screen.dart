@@ -102,18 +102,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // doesn't overpower the map visually.
   static const Color pickupPinColor = Color(0xFFB33A3A);
 
-  // Draggable sheet size fractions — reused by both the sheet and the
-  // floating controls so they can compute their offset in sync.
-  static const double _sheetMinSize = 0.235;
-  static const double _sheetMaxSize = 0.66;
-
   final MapController _mapController = MapController();
-
-  // Controls the draggable schedule sheet AND lets the floating controls
-  // (GPS button, pickup legend) read its live size so they can move up
-  // together with it as the user drags.
-  final DraggableScrollableController _sheetController =
-      DraggableScrollableController();
 
   late final EvLocationProvider _evProvider =
       (Platform.isAndroid || Platform.isIOS) && Firebase.apps.isNotEmpty
@@ -145,35 +134,19 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // arrival, or notification logic elsewhere in this file.
   final Map<String, bool> _evMovingStable = {};
 
-  // UI-only: remembers which index into the FULL round-trip route list
-  // each vehicle was LAST CONFIRMED at via a real isEvNearStop match. Only
-  // ever set when a genuine match happens — never defaulted/guessed. This
-  // lets the metro-line search correctly pick the RETURN-leg occurrence of
-  // a repeated stop name (e.g. the second "MAB3" on the way back) instead
-  // of always matching the first occurrence earlier in the list. Cleared
-  // whenever a vehicle goes offline, so a fresh shift always starts clean.
+  // UI-only: remembers the last stop genuinely reached by each EV.
+  // This is used only for route continuity; the metro line itself glows
+  // ONLY when the EV is physically inside the current pickup-point radius.
   final Map<String, int> _evLastRouteIndex = {};
 
-  // Auto-scroll controllers for the metro-line strips, one per vehicle,
-  // so the strip can animate to keep the current/next stop in view as
-  // progress advances. Purely a UI convenience — no effect on EV state.
+  // Horizontal controllers for the two permanent metro strips.
   final Map<String, ScrollController> _metroScrollControllers = {};
 
   String? _facultyBlockName;
   String? _notificationMessage;
 
-  // General "EV is at {block} pickup point" indicator — shows for EVERY
-  // faculty user regardless of their own assigned block, updates live to
-  // whichever block ANY EV currently sits near. Independent of the
-  // personal arrival notification below.
-  String? _evAtBlockName;
-
   bool _locationAvailable = false;
   bool _hasInitialMapCentered = false;
-
-  // Live fraction (0.0-1.0) of how far the sheet is dragged, used to push
-  // the bottom controls upward in sync with the sheet's drag.
-  double _sheetExtent = _sheetMinSize;
 
   late AnimationController _pulseController;
   late AnimationController _glowController;
@@ -205,17 +178,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       duration: const Duration(milliseconds: 2200),
     )..repeat(reverse: true);
 
-    _sheetController.addListener(_handleSheetDrag);
-
     _facultyLocationService = FacultyLocationService();
     _initialize();
-  }
-
-  void _handleSheetDrag() {
-    if (!_sheetController.isAttached) return;
-    setState(() {
-      _sheetExtent = _sheetController.size;
-    });
   }
 
   Future<void> _refreshEvStatus() async {
@@ -513,7 +477,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     // Runs for every faculty user regardless of their own block, checked
     // against every currently known vehicle.
-    _checkEvNearAnyBlock();
 
     if (_facultyPosition == null) return;
 
@@ -547,8 +510,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       }
       NotificationService.instance.cancelEvArrival();
     }
-
-    _checkEvNearAnyBlock();
   }
 
   // ---------------------------------------------------------------------------
@@ -556,6 +517,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // ---------------------------------------------------------------------------
 
   void _startEvAvailabilityCheck() {
+    for (final controller in _metroScrollControllers.values) {
+      controller.dispose();
+    }
+
     _evAvailabilityTimer?.cancel();
 
     _evAvailabilityTimer = Timer.periodic(const Duration(seconds: 2), (
@@ -609,7 +574,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     setState(() {
       _evLocations.clear();
       _notificationMessage = null;
-      _evAtBlockName = null;
     });
 
     _evMovingStable.clear();
@@ -644,7 +608,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         if (mounted) {
           setState(() {
             _notificationMessage =
-                '$vehicleId is arriving at ${facultyStop.name}';
+                '$vehicleId arrived at ${facultyStop.name} pickup point';
           });
         }
 
@@ -665,33 +629,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           NotificationService.instance.cancelEvArrival();
         }
       }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // EV AT ANY BLOCK — general pickup-point indicator (shown to ALL users)
-  // (UNCHANGED)
-  // ---------------------------------------------------------------------------
-
-  void _checkEvNearAnyBlock() {
-    final trackingService = EvTrackingService();
-
-    String? matchedBlockName;
-
-    for (final location in _evLocations.values) {
-      for (final stop in EvTrackingService.campusStops) {
-        if (trackingService.isEvNearStop(location.position, stop)) {
-          matchedBlockName = stop.name;
-          break;
-        }
-      }
-      if (matchedBlockName != null) break;
-    }
-
-    if (matchedBlockName != _evAtBlockName && mounted) {
-      setState(() {
-        _evAtBlockName = matchedBlockName;
-      });
     }
   }
 
@@ -766,13 +703,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       }
     }
 
-    // Genuinely not near ANY stop right now — never guess. If nothing has
-    // ever matched (lastIndex is null), the line correctly shows nothing
-    // as current/green, with stop 0 blinking as "not started yet." If it
-    // matched before and is currently between stops on the road, keep
-    // showing the last confirmed stop as current (normal "en route"
-    // behavior, not a bug).
-    return lastIndex;
+    // The EV is not inside ANY pickup-point radius right now. Do NOT keep
+    // the previous stop glowing: the metro line must reflect the physical
+    // EV position, not its last known stop. The line itself remains visible.
+    return null;
   }
 
   Future<void> _showLocationRequiredDialog({
@@ -873,13 +807,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   void dispose() {
     _pulseController.dispose();
     _glowController.dispose();
-    _sheetController.removeListener(_handleSheetDrag);
-    _sheetController.dispose();
-
-    for (final controller in _metroScrollControllers.values) {
-      controller.dispose();
-    }
-
     _evAvailabilityTimer?.cancel();
     _evSubscription?.cancel();
     _facultyLocationSubscription?.cancel();
@@ -974,7 +901,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             ),
 
             // ── Metro-style route progress strips — top free space ───────────
-            // One row per online EV, showing its fixed round-trip stop
+            // One permanent row per EV, showing its fixed round-trip stop
             // sequence with passed/current/next/upcoming states. Purely
             // additive, reads only from _evLocations (already-existing
             // state) plus the isEvNearStop geofence check (already-
@@ -985,28 +912,29 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               top: MediaQuery.of(context).padding.top + 6,
               child: Column(
                 children: [
-                  if (ev1Location != null)
-                    _buildMetroLine(
-                      vehicleId: 'EV1',
-                      routeOrder: _ev1RouteOrder,
-                      currentIndex: _currentRouteIndex(
-                        'EV1',
-                        ev1Location,
-                        _ev1RouteOrder,
-                      ),
-                    ),
-                  if (ev1Location != null && ev2Location != null)
-                    const SizedBox(height: 6),
-                  if (ev2Location != null)
-                    _buildMetroLine(
-                      vehicleId: 'EV2',
-                      routeOrder: _ev2RouteOrder,
-                      currentIndex: _currentRouteIndex(
-                        'EV2',
-                        ev2Location,
-                        _ev2RouteOrder,
-                      ),
-                    ),
+                  _buildMetroLine(
+                    vehicleId: 'EV1',
+                    routeOrder: _ev1RouteOrder,
+                    currentIndex: ev1Location == null
+                        ? null
+                        : _currentRouteIndex(
+                            'EV1',
+                            ev1Location,
+                            _ev1RouteOrder,
+                          ),
+                  ),
+                  const SizedBox(height: 6),
+                  _buildMetroLine(
+                    vehicleId: 'EV2',
+                    routeOrder: _ev2RouteOrder,
+                    currentIndex: ev2Location == null
+                        ? null
+                        : _currentRouteIndex(
+                            'EV2',
+                            ev2Location,
+                            _ev2RouteOrder,
+                          ),
+                  ),
                 ],
               ),
             ),
@@ -1023,18 +951,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 child: _buildLocationWarning(),
               ),
 
-            // ── EV At {Block} Pickup Point — shown to everyone, live ─────────
-            if (_evAtBlockName != null)
-              Positioned(
-                left: 16,
-                right: 16,
-                top:
-                    MediaQuery.of(context).padding.top +
-                    12 +
-                    _metroAreaHeight(ev1Location, ev2Location),
-                child: _buildEvAtBlockBanner(_evAtBlockName!),
-              ),
-
             // ── Personal Arrival Notification Banner ─────────────────────────
             if (_notificationMessage != null)
               Positioned(
@@ -1043,32 +959,29 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 top:
                     MediaQuery.of(context).padding.top +
                     _metroAreaHeight(ev1Location, ev2Location) +
-                    (_evAtBlockName != null
-                        ? 88
-                        : (_locationAvailable ? 12 : 92)),
+                    (_locationAvailable ? 12 : 92),
                 child: _buildNotificationBanner(),
               ),
 
-            // ── Bottom-left: Pickup legend — floats just above the sheet,
-            //     and rides up with it as the sheet is dragged ─────────────
+            // ── Pickup legend ───────────────────────────────────────────────
             Positioned(
               left: 16,
               top:
                   MediaQuery.of(context).padding.top +
                   12 +
                   _metroAreaHeight(ev1Location, ev2Location) +
-                  8,
+                  28,
               child: _buildPickupLegend(),
             ),
 
-            // ── Bottom-right: GPS recenter button — same behavior ────────────
+            // ── Map controls ─────────────────────────────────────────────────
             Positioned(
               right: 16,
               top:
                   MediaQuery.of(context).padding.top +
                   12 +
                   _metroAreaHeight(ev1Location, ev2Location) +
-                  8,
+                  28,
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1079,8 +992,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ),
 
-            // ── Draggable Shuttle Schedule Sheet ─────────────────────────────
-            Positioned.fill(
+            // ── Fixed Shuttle Information Panel ──────────────────────────────
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 10,
+              height: (MediaQuery.of(context).size.height * 0.217)
+                  .clamp(205.0, 225.0)
+                  .toDouble(),
               child: _buildPilotCard(facultyBlockName, anyEvAvailable),
             ),
           ],
@@ -1093,11 +1012,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // notification banners below it shift down instead of overlapping it.
   // Pure layout math — does not touch any EV state.
   double _metroAreaHeight(EvLocation? ev1, EvLocation? ev2) {
+    // Both metro strips are permanently rendered, including when an EV is
+    // offline. Keep overlays below the same fixed two-row area at all times.
     const lineHeight = 54.0;
     const gap = 6.0;
-    if (ev1 != null && ev2 != null) return (lineHeight * 2) + gap;
-    if (ev1 != null || ev2 != null) return lineHeight;
-    return 0.0;
+    return (lineHeight * 2) + gap;
   }
 
   // ---------------------------------------------------------------------------
@@ -1433,7 +1352,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         borderRadius: BorderRadius.circular(16),
         onTap: _refreshEvStatus,
         child: _buildGlassContainer(
-          padding: const EdgeInsets.all(12),
+          padding: const EdgeInsets.all(8),
           child: const Icon(Icons.refresh_rounded, color: vitBlue, size: 22),
         ),
       ),
@@ -1499,8 +1418,28 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   // Standard Google-Maps-style pin using Flutter's built-in Material icon,
   // in a muted/dulled red so it doesn't overpower the map visually.
+  bool _isEvNearPickupPoint(LatLng pickupPosition) {
+    const radiusMeters = 35.0;
+
+    for (final location in _evLocations.values) {
+      final distance = Geolocator.distanceBetween(
+        location.position.latitude,
+        location.position.longitude,
+        pickupPosition.latitude,
+        pickupPosition.longitude,
+      );
+
+      if (distance <= radiusMeters) return true;
+    }
+
+    return false;
+  }
+
+  // Pickup pin glows ONLY while an active EV is physically inside this
+  // pickup point's radius. Every pickup point is checked independently.
   Marker _buildPickupMarker(LatLng position) {
     const pinSize = 40.0;
+    final evInsideRadius = _isEvNearPickupPoint(position);
 
     return Marker(
       point: position,
@@ -1510,28 +1449,31 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       child: AnimatedBuilder(
         animation: _glowController,
         builder: (context, child) {
-          final glow = 0.20 + (_glowController.value * 0.15);
+          final glow = evInsideRadius
+              ? 0.35 + (_glowController.value * 0.30)
+              : 0.0;
 
           return Stack(
             alignment: Alignment.topCenter,
             children: [
-              Positioned(
-                top: 2,
-                child: Container(
-                  width: 26,
-                  height: 26,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: pickupPinColor.withValues(alpha: glow),
-                        blurRadius: 12,
-                        spreadRadius: 1.5,
-                      ),
-                    ],
+              if (evInsideRadius)
+                Positioned(
+                  top: 2,
+                  child: Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: pickupPinColor.withValues(alpha: glow),
+                          blurRadius: 15,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
               Icon(
                 Icons.location_on_rounded,
                 color: pickupPinColor,
@@ -1832,52 +1774,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // BANNERS & WARNINGS
   // ---------------------------------------------------------------------------
 
-  Widget _buildEvAtBlockBanner(String blockName) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 0.0, end: 1.0),
-      duration: const Duration(milliseconds: 350),
-      curve: Curves.easeOutBack,
-      builder: (context, value, child) {
-        return Transform.scale(
-          scale: 0.95 + (0.05 * value),
-          child: Opacity(opacity: value.clamp(0.0, 1.0), child: child),
-        );
-      },
-      child: _buildGlassContainer(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        borderRadius: BorderRadius.circular(22),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: vitBlue.withValues(alpha: 0.12),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.electric_rickshaw_rounded,
-                color: vitBlue,
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                'EV AT $blockName PICKUP POINT',
-                style: const TextStyle(
-                  color: vitBlue,
-                  fontSize: 14.5,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.2,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildNotificationBanner() {
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),
@@ -2089,7 +1985,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ],
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 3),
           Row(
             children: [
               Expanded(
@@ -2104,7 +2000,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 4),
           Text(
             'Current: $current',
             maxLines: 2,
@@ -2122,7 +2018,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: Colors.grey.shade600,
-              fontSize: 10.5,
+              fontSize: 10,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -2135,114 +2031,112 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // BOTTOM DRAGGABLE CARD
   // ---------------------------------------------------------------------------
 
+  // Fixed, non-scrollable bottom panel. The panel height is controlled by
+  // the Positioned widget in build(), so the map remains stable and the
+  // information stays visible without dragging or inner scrolling.
   Widget _buildPilotCard(String facultyBlockName, bool anyEvAvailable) {
-    return DraggableScrollableSheet(
-      controller: _sheetController,
-      initialChildSize: _sheetMinSize,
-      minChildSize: _sheetMinSize,
-      maxChildSize: _sheetMaxSize,
-      snap: true,
-      snapSizes: const [_sheetMinSize, _sheetMaxSize],
-      builder: (context, scrollController) {
-        return Container(
-          margin: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.94),
-            borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.7),
-              width: 1.2,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.22),
-                blurRadius: 28,
-                offset: const Offset(0, -8),
-              ),
-            ],
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.96),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.75),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.24),
+            blurRadius: 28,
+            offset: const Offset(0, -8),
           ),
-          child: ListView(
-            controller: scrollController,
-            physics: const ClampingScrollPhysics(),
-            padding: EdgeInsets.fromLTRB(
-              20,
-              10,
-              20,
-              MediaQuery.of(context).padding.bottom + 24,
-            ),
-            children: [
-              Center(
-                child: Container(
-                  width: 38,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.grey.withValues(alpha: 0.35),
-                    borderRadius: BorderRadius.circular(3),
-                  ),
+        ],
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          16,
+          6,
+          16,
+          MediaQuery.of(context).padding.bottom + 6,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.withValues(alpha: 0.35),
+                  borderRadius: BorderRadius.circular(3),
                 ),
               ),
-              const SizedBox(height: 12),
-
-              Row(
-                children: [
-                  Container(
-                    width: 48,
-                    height: 48,
-                    decoration: BoxDecoration(
-                      gradient: const LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [vitGreenSoft, vitGreen],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [vitGreenSoft, vitGreen],
+                    ),
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: [
+                      BoxShadow(
+                        color: vitGreen.withValues(alpha: 0.28),
+                        blurRadius: 9,
+                        offset: const Offset(0, 3),
                       ),
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: [
-                        BoxShadow(
-                          color: vitGreen.withValues(alpha: 0.3),
-                          blurRadius: 10,
-                          offset: const Offset(0, 3),
-                        ),
-                      ],
-                    ),
-                    child: const Icon(
-                      Icons.electric_rickshaw_rounded,
-                      color: Colors.white,
-                      size: 26,
-                    ),
+                    ],
                   ),
-                  const SizedBox(width: 13),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'VIT EV Shuttle',
-                          style: TextStyle(
-                            color: vitBlue,
-                            fontSize: 17.5,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          facultyBlockName == 'Not assigned'
-                              ? 'Your block: Not assigned'
-                              : 'Your block: $facultyBlockName',
-                          style: TextStyle(
-                            color: facultyBlockName == 'Not assigned'
-                                ? Colors.orange.shade800
-                                : Colors.grey.shade600,
-                            fontSize: 12.5,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
+                  child: const Icon(
+                    Icons.electric_rickshaw_rounded,
+                    color: Colors.white,
+                    size: 21,
                   ),
-                ],
-              ),
-
-              const SizedBox(height: 14),
-              Row(
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'VIT EV Shuttle',
+                        style: TextStyle(
+                          color: vitBlue,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        facultyBlockName == 'Not assigned'
+                            ? 'Your pickup point: Not assigned'
+                            : 'Your pickup point: $facultyBlockName',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: facultyBlockName == 'Not assigned'
+                              ? Colors.orange.shade800
+                              : Colors.grey.shade600,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _buildStatusBadge(anyEvAvailable),
+              ],
+            ),
+            const SizedBox(height: 7),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Expanded(
                     child: _buildEvStatusCard(
@@ -2251,7 +2145,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       _ev1RouteOrder,
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 6),
                   Expanded(
                     child: _buildEvStatusCard(
                       'EV2',
@@ -2261,10 +2155,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                   ),
                 ],
               ),
-            ],
-          ),
-        );
-      },
+            ),
+          ],
+        ),
+      ),
     );
   }
 

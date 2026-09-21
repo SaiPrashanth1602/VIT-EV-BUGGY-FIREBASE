@@ -10,7 +10,11 @@ class NotificationService {
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
 
+  bool _initialized = false;
+
   Future<void> initialize() async {
+    if (_initialized) return;
+
     const androidSettings = AndroidInitializationSettings(
       '@mipmap/ic_launcher',
     );
@@ -35,9 +39,13 @@ class NotificationService {
     await androidPlugin?.createNotificationChannel(channel);
 
     await androidPlugin?.requestNotificationsPermission();
+
+    _initialized = true;
   }
 
   Future<void> showEvArrival({required String blockName}) async {
+    if (!_initialized) return;
+
     const androidDetails = AndroidNotificationDetails(
       'ev_arrival',
       'EV Arrival',
@@ -60,6 +68,7 @@ class NotificationService {
   }
 
   Future<void> cancelEvArrival() async {
+    if (!_initialized) return;
     await _plugin.cancel(arrivalNotificationId);
   }
 }

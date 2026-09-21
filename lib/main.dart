@@ -1,15 +1,19 @@
-import 'package:flutter/material.dart';
+import 'dart:io';
+
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/material.dart';
 import 'screens/faculty/faculty_home_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  try {
-    await Firebase.initializeApp();
-  } catch (_) {
-    // Keep the UI responsive even when Firebase is unavailable during tests or
-    // a partially configured startup environment.
+  if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+    try {
+      await Firebase.initializeApp();
+    } catch (_) {
+      // Keep the UI responsive even when Firebase is unavailable during tests or
+      // a partially configured startup environment.
+    }
   }
 
   runApp(const VitEvBuggyFacultyApp());
