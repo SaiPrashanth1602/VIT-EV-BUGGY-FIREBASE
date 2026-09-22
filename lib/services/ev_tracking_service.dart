@@ -403,7 +403,8 @@ class EvTrackingService {
     // Arrival/glow logic must use ONLY the actual pickup point.
     // The building/block coordinate is used for faculty eligibility and
     // must never make a stop glow when the EV is still elsewhere.
-    final distanceToPickup = distanceBetween(evPosition, stop.pickupPosition);
+    final distanceToPickup =
+        distanceBetween(evPosition, stop.pickupPosition);
 
     return distanceToPickup <= evTriggerRadiusMeters;
   }

@@ -109,15 +109,14 @@ class FacultyLocationService {
     }
 
     try {
-      _positionSubscription =
-          Geolocator.getPositionStream(
-            locationSettings: locationSettings,
-          ).listen(
-            (Position position) => _handleRawFix(position),
-            onError: (error) {
-              // Handle stream location errors gracefully
-            },
-          );
+      _positionSubscription = Geolocator.getPositionStream(
+        locationSettings: locationSettings,
+      ).listen(
+        (Position position) => _handleRawFix(position),
+        onError: (error) {
+          // Handle stream location errors gracefully
+        },
+      );
       return true;
     } catch (_) {
       return false;

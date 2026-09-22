@@ -139,6 +139,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // ONLY when the EV is physically inside the current pickup-point radius.
   final Map<String, int> _evLastRouteIndex = {};
 
+  // True only while the EV is physically inside its currently confirmed
+  // pickup-point radius. A 5-second departure debounce prevents GPS jitter
+  // from immediately changing the stop from green to yellow.
+  final Map<String, bool> _evAtPickupStop = {};
+
+  // Per-EV departure debounce timers.
+  final Map<String, Timer> _evDepartureTimers = {};
+
   // Horizontal controllers for the two permanent metro strips.
   final Map<String, ScrollController> _metroScrollControllers = {};
 
@@ -494,6 +502,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
 
     _evMovingStable.remove(vehicleId);
+    _evDepartureTimers.remove(vehicleId)?.cancel();
+    _evAtPickupStop.remove(vehicleId);
 
     // Vehicle went offline (shift ended) — drop its remembered route
     // position so the NEXT time it comes online (new shift), the metro
@@ -578,15 +588,45 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     _evMovingStable.clear();
     _evLastRouteIndex.clear();
+    _evAtPickupStop.clear();
+    for (final timer in _evDepartureTimers.values) {
+      timer.cancel();
+    }
+    _evDepartureTimers.clear();
     _evInsideFacultyBlockIds.clear();
 
     NotificationService.instance.cancelEvArrival();
   }
 
   // ---------------------------------------------------------------------------
-  // EV ARRIVAL / GEOFENCING (personal — only for the viewer's own block)
-  // (UNCHANGED)
+  // EV ARRIVAL / GEOFENCING
+  //
+  // IMPORTANT:
+  // A faculty member must ONLY be notified by a vehicle that actually serves
+  // their pickup block.
+  //
+  // Example:
+  //   Faculty at AB1 + EV1 inside AB1 radius -> NOTIFY
+  //   Faculty at AB1 + EV2 inside AB1 radius -> DO NOT NOTIFY
+  //
+  // The physical 35 m geofence is still checked by EvTrackingService.
   // ---------------------------------------------------------------------------
+
+  bool _vehicleServesFacultyBlock(String vehicleId, String blockName) {
+    switch (vehicleId) {
+      case 'EV1':
+        return _ev1OutboundByBlock.containsKey(blockName) ||
+            _ev1ReturnByBlock.containsKey(blockName);
+
+      case 'EV2':
+        return _ev2OutboundByBlock.containsKey(blockName) ||
+            _ev2ReturnByBlock.containsKey(blockName);
+
+      default:
+        // Only EV1 and EV2 are valid shuttle vehicles in this project.
+        return false;
+    }
+  }
 
   void _checkEvArrival(
     LatLng facultyPosition,
@@ -594,12 +634,38 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     EvLocation evLocation,
   ) {
     final trackingService = EvTrackingService();
+    final vehicleId = evLocation.vehicleId;
+    final blockName = facultyStop.name;
+
+    // First enforce the route assignment.
+    //
+    // This prevents an EV from another route from notifying a faculty member
+    // simply because both vehicles can physically pass through/near the same
+    // pickup coordinate.
+    final vehicleServesBlock = _vehicleServesFacultyBlock(vehicleId, blockName);
+
+    if (!vehicleServesBlock) {
+      // If this vehicle was previously considered inside the faculty block,
+      // clear only its arrival state. It must never create a notification.
+      if (_evInsideFacultyBlockIds.remove(vehicleId) &&
+          _evInsideFacultyBlockIds.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _notificationMessage = null;
+          });
+        }
+
+        NotificationService.instance.cancelEvArrival();
+      }
+
+      return;
+    }
+
+    // Route is valid, now perform the exact physical pickup-point geofence.
     final evNear = trackingService.isEvNearStop(
       evLocation.position,
       facultyStop,
     );
-
-    final vehicleId = evLocation.vehicleId;
 
     if (evNear) {
       if (!_evInsideFacultyBlockIds.contains(vehicleId)) {
@@ -608,17 +674,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         if (mounted) {
           setState(() {
             _notificationMessage =
-                '$vehicleId arrived at ${facultyStop.name} pickup point';
+                '$vehicleId arrived at $blockName pickup point';
           });
         }
 
-        NotificationService.instance.showEvArrival(blockName: facultyStop.name);
+        NotificationService.instance.showEvArrival(blockName: blockName);
       }
     } else {
       if (_evInsideFacultyBlockIds.remove(vehicleId)) {
         if (mounted) {
           setState(() {
-            // Only clear the banner if no other vehicle is still inside.
+            // Only clear the banner if no other valid vehicle is still inside.
             if (_evInsideFacultyBlockIds.isEmpty) {
               _notificationMessage = null;
             }
@@ -652,7 +718,33 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // the last confirmed index first, so later matches correctly resolve to
   // the RETURN-leg occurrence instead of snapping back to the outbound one.
 
-  int? _currentRouteIndex(
+  // ---------------------------------------------------------------------------
+  // ROUTE PROGRESS STATE
+  //
+  // There are two different states:
+  //
+  //   _evLastRouteIndex = the last stop the EV has genuinely reached.
+  //   _evAtPickupStop   = whether it is still physically at that stop.
+  //
+  // The EV must remain outside the 35 m pickup radius for 5 continuous
+  // seconds before _evAtPickupStop becomes false. This prevents GPS jitter
+  // from instantly changing GREEN -> YELLOW.
+  //
+  // Route indices are always resolved FORWARD from the last confirmed index.
+  // This is critical because MAB3, AB2/4 and AB3 occur twice on the round
+  // trip. We must never jump back to the outbound occurrence on the return.
+  // ---------------------------------------------------------------------------
+
+  CampusStop _routeStopFor(String name) {
+    final normalizedName = name == 'AB2, AB4 Junction' ? 'AB2-4' : name;
+
+    return EvTrackingService.campusStops.firstWhere(
+      (s) => s.name == normalizedName,
+      orElse: () => throw StateError('Unknown metro stop: $name'),
+    );
+  }
+
+  int? _findForwardRouteMatch(
     String vehicleId,
     EvLocation location,
     List<String> routeOrder,
@@ -660,53 +752,100 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final trackingService = EvTrackingService();
     final lastIndex = _evLastRouteIndex[vehicleId];
 
-    CampusStop stopFor(String name) => EvTrackingService.campusStops.firstWhere(
-      (s) => s.name == name,
-      orElse: () => EvTrackingService.campusStops.first,
-    );
+    // Once progress exists, never search earlier route occurrences.
+    final startIndex = lastIndex ?? 0;
 
-    // If we have a remembered position, search forward from there first.
-    if (lastIndex != null) {
-      for (int i = lastIndex; i < routeOrder.length; i++) {
-        if (trackingService.isEvNearStop(
-          location.position,
-          stopFor(routeOrder[i]),
-        )) {
-          _evLastRouteIndex[vehicleId] = i;
-          return i;
-        }
-      }
+    for (int i = startIndex; i < routeOrder.length; i++) {
+      final stop = _routeStopFor(routeOrder[i]);
 
-      // Not found ahead — check if it's back at the very start (new lap),
-      // only valid once we'd already progressed well into the route.
-      if (lastIndex >= routeOrder.length - 2) {
-        if (trackingService.isEvNearStop(
-          location.position,
-          stopFor(routeOrder[0]),
-        )) {
-          _evLastRouteIndex[vehicleId] = 0;
-          return 0;
-        }
-      }
-    }
-
-    // No remembered position yet, OR the forward search above found
-    // nothing — do a full search from the beginning. This ONLY sets and
-    // returns an index if a real geofence match is found right now.
-    for (int i = 0; i < routeOrder.length; i++) {
-      if (trackingService.isEvNearStop(
-        location.position,
-        stopFor(routeOrder[i]),
-      )) {
-        _evLastRouteIndex[vehicleId] = i;
+      if (trackingService.isEvNearStop(location.position, stop)) {
         return i;
       }
     }
 
-    // The EV is not inside ANY pickup-point radius right now. Do NOT keep
-    // the previous stop glowing: the metro line must reflect the physical
-    // EV position, not its last known stop. The line itself remains visible.
     return null;
+  }
+
+  void _updateRouteState(
+    String vehicleId,
+    EvLocation location,
+    List<String> routeOrder,
+  ) {
+    final matchedIndex = _findForwardRouteMatch(
+      vehicleId,
+      location,
+      routeOrder,
+    );
+
+    if (matchedIndex != null) {
+      final previousIndex = _evLastRouteIndex[vehicleId];
+
+      // Never move backwards. If the EV is still at the same stop, keep the
+      // same route occurrence. If it reaches a later occurrence, advance.
+      if (previousIndex == null || matchedIndex > previousIndex) {
+        _evLastRouteIndex[vehicleId] = matchedIndex;
+      }
+
+      // The EV is physically at a pickup point again, so cancel any pending
+      // 5-second departure confirmation.
+      _evDepartureTimers.remove(vehicleId)?.cancel();
+
+      _evAtPickupStop[vehicleId] = true;
+      return;
+    }
+
+    final lastIndex = _evLastRouteIndex[vehicleId];
+    if (lastIndex == null) return;
+
+    // We are outside the current pickup radius. Do not immediately turn the
+    // stop yellow; wait 5 seconds in case this is GPS jitter.
+    if (_evAtPickupStop[vehicleId] != true) return;
+    if (_evDepartureTimers.containsKey(vehicleId)) return;
+
+    _evDepartureTimers[vehicleId] = Timer(const Duration(seconds: 5), () {
+      _evDepartureTimers.remove(vehicleId);
+
+      if (!mounted) return;
+
+      final latestLocation = _evLocations[vehicleId];
+      if (latestLocation == null) return;
+
+      final currentIndex = _evLastRouteIndex[vehicleId];
+      if (currentIndex == null ||
+          currentIndex < 0 ||
+          currentIndex >= routeOrder.length) {
+        return;
+      }
+
+      final currentStop = _routeStopFor(routeOrder[currentIndex]);
+      final stillAtStop = EvTrackingService().isEvNearStop(
+        latestLocation.position,
+        currentStop,
+      );
+
+      if (stillAtStop) {
+        // GPS came back into the radius during the debounce window.
+        _evAtPickupStop[vehicleId] = true;
+        return;
+      }
+
+      // Confirmed departure: current stop is now yellow/passed and the
+      // arrow moves to currentIndex + 1.
+      _evAtPickupStop[vehicleId] = false;
+      setState(() {});
+    });
+  }
+
+  // Returns the last confirmed route occurrence. The UI separately checks
+  // _evAtPickupStop to decide whether that occurrence is GREEN (still there)
+  // or YELLOW (departed).
+  int? _currentRouteIndex(
+    String vehicleId,
+    EvLocation location,
+    List<String> routeOrder,
+  ) {
+    _updateRouteState(vehicleId, location, routeOrder);
+    return _evLastRouteIndex[vehicleId];
   }
 
   Future<void> _showLocationRequiredDialog({
@@ -939,28 +1078,19 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ),
 
-            // ── Location Warning ────────────────────────────────────────────
-            if (!_locationAvailable)
-              Positioned(
-                left: 16,
-                right: 16,
-                top:
-                    MediaQuery.of(context).padding.top +
-                    12 +
-                    _metroAreaHeight(ev1Location, ev2Location),
-                child: _buildLocationWarning(),
-              ),
-
             // ── Personal Arrival Notification Banner ─────────────────────────
             if (_notificationMessage != null)
-              Positioned(
-                left: 16,
-                right: 16,
-                top:
-                    MediaQuery.of(context).padding.top +
-                    _metroAreaHeight(ev1Location, ev2Location) +
-                    (_locationAvailable ? 12 : 92),
-                child: _buildNotificationBanner(),
+              Positioned.fill(
+                child: Align(
+                  alignment: Alignment.center,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(
+                      maxWidth: 360,
+                      minWidth: 300,
+                    ),
+                    child: _buildNotificationBanner(),
+                  ),
+                ),
               ),
 
             // ── Pickup legend ───────────────────────────────────────────────
@@ -997,8 +1127,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               left: 12,
               right: 12,
               bottom: 10,
-              height: (MediaQuery.of(context).size.height * 0.217)
-                  .clamp(205.0, 225.0)
+              height: (MediaQuery.of(context).size.height * 0.245)
+                  .clamp(235.0, 255.0)
                   .toDouble(),
               child: _buildPilotCard(facultyBlockName, anyEvAvailable),
             ),
@@ -1025,8 +1155,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   //
   // Renders one horizontal line for a single EV's full round-trip route:
   //   - Stops before `currentIndex`  -> passed (dull yellow/orange)
-  //   - Stop at `currentIndex`       -> current (solid green)
+  //   - Stop at `currentIndex`       -> current/at pickup (solid green)
+  //                                      ONLY while physically there
   //   - Stop at `currentIndex + 1`   -> next / approaching (blinking)
+  //   - After a 5-second confirmed departure, the former current becomes
+  //     yellow and the next stop becomes the route focus.
   //   - Everything after that        -> upcoming (neutral grey)
   //   - If `currentIndex` is null (EV online but hasn't reached its first
   //     stop yet, or nowhere near any stop at all), NOTHING is green —
@@ -1042,6 +1175,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     required int? currentIndex,
   }) {
     final nextIndex = (currentIndex ?? -1) + 1;
+    final isAtPickupStop = _evAtPickupStop[vehicleId] ?? false;
 
     final controller = _metroScrollControllers.putIfAbsent(
       vehicleId,
@@ -1051,7 +1185,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     // Auto-scroll to bring the focus stop (current, or next if nothing
     // is current yet) into view, without fighting the user if they're
     // actively scrolling it themselves.
-    final focusIndex = currentIndex ?? nextIndex;
+    final focusIndex = isAtPickupStop ? (currentIndex ?? nextIndex) : nextIndex;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!controller.hasClients) return;
       const segmentWidth = 64.0; // 46 label width + 18 connector width
@@ -1099,9 +1233,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 physics: const BouncingScrollPhysics(),
                 child: Row(
                   children: List.generate(routeOrder.length, (i) {
+                    final isCurrent = isAtPickupStop && i == currentIndex;
                     final isPassed = currentIndex != null && i < currentIndex;
-                    final isCurrent = i == currentIndex;
-                    final isNext = i == nextIndex;
+                    final isNext = currentIndex != null && i == nextIndex;
 
                     final dot = _buildMetroDot(
                       isPassed: isPassed,
@@ -1140,7 +1274,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                         currentIndex != null && i < currentIndex;
 
                     final isActiveConnector =
-                        currentIndex != null && i == currentIndex;
+                        currentIndex != null &&
+                        i == currentIndex &&
+                        currentIndex + 1 < routeOrder.length;
                     return Row(
                       children: [
                         segment,
@@ -1234,7 +1370,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       );
     }
 
-    // The next stop stays neutral; only the live EV position glows.
+    // The next stop stays neutral until the EV physically reaches it.
     if (isNext) {
       return Container(
         width: 12,
@@ -1785,151 +1921,83 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           child: Opacity(opacity: value.clamp(0.0, 1.0), child: child),
         );
       },
-      child: _buildGlassContainer(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        borderRadius: BorderRadius.circular(22),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: vitGreen.withValues(alpha: 0.12),
-                shape: BoxShape.circle,
+      child: Material(
+        color: Colors.transparent,
+        child: _buildGlassContainer(
+          padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+          borderRadius: BorderRadius.circular(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  color: vitGreen.withValues(alpha: 0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.notifications_active_rounded,
+                  color: vitGreen,
+                  size: 27,
+                ),
               ),
-              child: const Icon(
-                Icons.notifications_active_rounded,
-                color: vitGreen,
-                size: 22,
+              const SizedBox(height: 10),
+              const Text(
+                'Ready for pickup',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: vitBlue,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w900,
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: vitGreen,
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: const Text(
-                          'ARRIVING',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 9.5,
-                            fontWeight: FontWeight.w900,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
+              const SizedBox(height: 6),
+              Text(
+                _notificationMessage!,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.grey.shade700,
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                height: 40,
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(11),
+                    onTap: () {
+                      HapticFeedback.lightImpact();
+                      setState(() => _notificationMessage = null);
+                      NotificationService.instance.cancelEvArrival();
+                    },
+                    child: Container(
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: vitBlue,
+                        borderRadius: BorderRadius.circular(11),
                       ),
-                      const SizedBox(width: 6),
-                      Text(
-                        'Ready for pickup',
+                      child: const Text(
+                        'CLOSE',
                         style: TextStyle(
-                          color: Colors.grey.shade500,
+                          color: Colors.white,
                           fontSize: 11,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.8,
                         ),
                       ),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _notificationMessage!,
-                    style: const TextStyle(
-                      color: vitBlue,
-                      fontSize: 14.5,
-                      fontWeight: FontWeight.w700,
                     ),
                   ),
-                ],
+                ),
               ),
-            ),
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              onPressed: () {
-                HapticFeedback.lightImpact();
-                setState(() => _notificationMessage = null);
-                NotificationService.instance.cancelEvArrival();
-              },
-              icon: Icon(
-                Icons.close_rounded,
-                color: Colors.grey.shade400,
-                size: 20,
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
-      ),
-    );
-  }
-
-  Widget _buildLocationWarning() {
-    return _buildGlassContainer(
-      padding: const EdgeInsets.all(15),
-      borderRadius: BorderRadius.circular(18),
-      child: Row(
-        children: [
-          Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-              color: Colors.orange.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(
-              Icons.location_off_rounded,
-              color: Colors.orange.shade800,
-              size: 22,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'LOCATION REQUIRED',
-                  style: TextStyle(
-                    color: vitBlue,
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.5,
-                  ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  'Needed for block detection & arrival alerts',
-                  style: TextStyle(
-                    color: Colors.grey.shade600,
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          TextButton(
-            onPressed: _startFacultyLocation,
-            style: TextButton.styleFrom(
-              foregroundColor: vitGreen,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-            ),
-            child: const Text(
-              'ENABLE',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0.4,
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }
