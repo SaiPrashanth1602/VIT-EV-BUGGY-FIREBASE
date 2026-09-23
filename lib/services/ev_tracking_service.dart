@@ -28,7 +28,7 @@ class EvTrackingService {
   static const double ab5EligibilityRadiusMeters = 50.0;
   static const double ab24EligibilityRadiusMeters = 115.0;
 
-  static const double evTriggerRadiusMeters = 50.0;
+  static const double evTriggerRadiusMeters = 35.0;
 
   // ---------------------------------------------------------------------------
   // PICKUP LOCATIONS

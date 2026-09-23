@@ -24,7 +24,7 @@ class FacultyHomeScreen extends StatefulWidget {
 }
 
 class _FacultyHomeScreenState extends State<FacultyHomeScreen>
-    with TickerProviderStateMixin, WidgetsBindingObserver {
+    with TickerProviderStateMixin {
   // ── Official shuttle schedule (VIT Chennai timetable) ──────────────────────
   static const Map<String, List<int>> _ev1OutboundByBlock = {
     'AB1': [468, 523, 578, 633, 688, 743, 828, 883, 938],
@@ -134,12 +134,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   final Map<String, int> _evLastRouteIndex = {};
 
   // True only while the EV is physically inside its currently confirmed
-  // pickup-point radius. A 3-second departure debounce prevents GPS jitter
+  // pickup-point radius. A 5-second departure debounce prevents GPS jitter
   // from immediately changing the stop from green to yellow.
   final Map<String, bool> _evAtPickupStop = {};
 
   // Per-EV departure debounce timers.
   final Map<String, Timer> _evDepartureTimers = {};
+
+  // Horizontal controllers for the two permanent metro strips.
 
   String? _facultyBlockName;
   String? _notificationMessage;
@@ -165,7 +167,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
 
     _pulseController = AnimationController(
       vsync: this,
@@ -225,34 +226,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     } catch (error, stackTrace) {
       debugPrint('❌ FACULTY LOCATION ERROR: $error');
       debugPrint('$stackTrace');
-    }
-  }
-
-  // ── Display-name helpers ───────────────────────────────────────────────────
-  // Physical/map block names stay simple. EV route/timetable labels use the
-  // explicit JUNCTION name so the two concepts are not mixed up.
-  String _displayBlockName(String blockName) {
-    switch (blockName) {
-      case 'AB2, AB4 Junction':
-        return 'AB2, AB4';
-      case 'MAB3, MAB4 Junction':
-        return 'MAB3, MAB4';
-      default:
-        return blockName;
-    }
-  }
-
-  String _evDisplayBlockName(String blockName) {
-    switch (blockName) {
-      case 'AB2, AB4':
-      case 'AB2-4':
-      case 'AB2, AB4 Junction':
-        return 'AB2, AB4 JUNCTION';
-      case 'MAB3, MAB4':
-      case 'MAB3, MAB4 Junction':
-        return 'MAB3, MAB4 JUNCTION';
-      default:
-        return blockName;
     }
   }
 
@@ -370,45 +343,58 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // FACULTY LOCATION
   // ---------------------------------------------------------------------------
 
-  Future<void> _startFacultyLocation({bool requestIfDenied = true}) async {
+  Future<void> _startFacultyLocation() async {
     try {
       final serviceEnabled = await _facultyLocationService
           .isLocationServiceEnabled();
 
       if (!serviceEnabled) {
-        if (mounted && requestIfDenied) {
+        if (mounted) {
+          setState(() => _locationAvailable = false);
           await _showLocationRequiredDialog(
             title: 'Location services required',
             message:
-                'Turn on device location so VIT EV Buggy can show your position '
-                'and identify your nearby campus pickup point.',
+                'VIT EV Buggy needs your device location to identify your nearby '
+                'campus block and provide EV arrival notifications when the buggy '
+                'approaches your pickup point.',
             actionText: 'Open Settings',
             onAction: () => _facultyLocationService.openLocationSettings(),
           );
         }
-        if (mounted) setState(() => _locationAvailable = false);
         return;
       }
 
       var permission = await _facultyLocationService.getPermissionStatus();
 
-      // On the first app open, go directly to Android's real permission
-      // dialog. Do not put a custom Flutter dialog in front of it.
-      if (permission == LocationPermission.denied && requestIfDenied) {
-        permission = await _facultyLocationService.requestPermission();
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          await _showLocationRequiredDialog(
+            title: 'Location access required',
+            message:
+                'VIT EV Buggy uses your location to identify your nearby campus '
+                'block and provide EV arrival notifications when the buggy '
+                'approaches your pickup point.\n\n'
+                'Location access is required for this feature to work correctly.',
+            actionText: 'Allow Location',
+            onAction: () async {
+              await _facultyLocationService.requestPermission();
+            },
+          );
+        }
       }
 
-      if (permission == LocationPermission.deniedForever) {
-        if (mounted) setState(() => _locationAvailable = false);
+      final updatedPermission = await _facultyLocationService
+          .getPermissionStatus();
 
-        // Only send the user to App Settings after they explicitly try the
-        // location button (or another explicit retry), not on first launch.
-        if (mounted && requestIfDenied) {
+      if (updatedPermission == LocationPermission.deniedForever) {
+        if (mounted) {
+          setState(() => _locationAvailable = false);
           await _showLocationRequiredDialog(
             title: 'Location permission blocked',
             message:
-                'Location access is blocked for VIT EV Buggy. Enable it from '
-                'Android App Settings to show your location on the map.',
+                'Location access has been permanently denied for VIT EV Buggy. '
+                'Please enable location permission from your device settings '
+                'to use block detection and EV arrival notifications.',
             actionText: 'Open Settings',
             onAction: () => _facultyLocationService.openAppSettings(),
           );
@@ -416,7 +402,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         return;
       }
 
-      if (permission == LocationPermission.denied) {
+      if (updatedPermission == LocationPermission.denied) {
         if (mounted) setState(() => _locationAvailable = false);
         return;
       }
@@ -432,52 +418,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
       final initialPosition = await _facultyLocationService
           .getCurrentPosition();
-
       if (initialPosition != null) {
         _handleFacultyPosition(initialPosition);
       }
 
       _facultyLocationSubscription ??= _facultyLocationService.locationStream
           .listen(_handleFacultyPosition, onError: (_) {});
-    } catch (error, stackTrace) {
-      debugPrint('FACULTY LOCATION START ERROR: $error');
-      debugPrint('$stackTrace');
-      if (mounted) setState(() => _locationAvailable = false);
-    }
-  }
-
-  Future<void> _requestLocationFromMapButton() async {
-    final permission = await _facultyLocationService.getPermissionStatus();
-
-    if (permission == LocationPermission.deniedForever) {
-      if (!mounted) return;
-      await _showLocationRequiredDialog(
-        title: 'Location permission blocked',
-        message:
-            'Location access is blocked for VIT EV Buggy. Enable it from '
-            'Android App Settings to show your location on the map.',
-        actionText: 'Open Settings',
-        onAction: () => _facultyLocationService.openAppSettings(),
-      );
-      return;
-    }
-
-    await _startFacultyLocation(requestIfDenied: true);
-
-    if (!mounted) return;
-
-    final pos = _facultyPosition;
-    if (pos != null) {
-      _mapController.move(pos, 17.0);
-    }
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      // This handles the case where the user enables location permission or
-      // location services in Android Settings and returns to the app.
-      _startFacultyLocation(requestIfDenied: false);
+    } catch (_) {
+      // Location plugin fallback logic.
     }
   }
 
@@ -546,7 +494,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
 
     _evMovingStable.remove(vehicleId);
-    _evDepartureTimers.remove(vehicleId)?.cancel();
+    final timersToCancel = _evDepartureTimers.keys
+        .where((key) => key.startsWith('$vehicleId:'))
+        .toList();
+    for (final key in timersToCancel) {
+      _evDepartureTimers.remove(key)?.cancel();
+    }
     _evAtPickupStop.remove(vehicleId);
 
     // Vehicle went offline (shift ended) — drop its remembered route
@@ -649,38 +602,18 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   //   Faculty at AB1 + EV1 inside AB1 radius -> NOTIFY
   //   Faculty at AB1 + EV2 inside AB1 radius -> DO NOT NOTIFY
   //
-  // The physical 35 m geofence is still checked by EvTrackingService.
+  // The physical 50 m geofence is still checked by EvTrackingService.
   // ---------------------------------------------------------------------------
 
-  String _normalizeEvBlockKey(String blockName) {
-    switch (blockName) {
-      case 'AB2-4':
-      case 'AB2, AB4':
-      case 'AB2, AB4 Junction':
-        return 'AB2, AB4 Junction';
-
-      case 'MAB3':
-      case 'MAB4':
-      case 'MAB3, MAB4':
-      case 'MAB3, MAB4 Junction':
-        return 'MAB3, MAB4 Junction';
-
-      default:
-        return blockName;
-    }
-  }
-
   bool _vehicleServesFacultyBlock(String vehicleId, String blockName) {
-    final normalizedBlockName = _normalizeEvBlockKey(blockName);
-
     switch (vehicleId) {
       case 'EV1':
-        return _ev1OutboundByBlock.containsKey(normalizedBlockName) ||
-            _ev1ReturnByBlock.containsKey(normalizedBlockName);
+        return _ev1OutboundByBlock.containsKey(blockName) ||
+            _ev1ReturnByBlock.containsKey(blockName);
 
       case 'EV2':
-        return _ev2OutboundByBlock.containsKey(normalizedBlockName) ||
-            _ev2ReturnByBlock.containsKey(normalizedBlockName);
+        return _ev2OutboundByBlock.containsKey(blockName) ||
+            _ev2ReturnByBlock.containsKey(blockName);
 
       default:
         // Only EV1 and EV2 are valid shuttle vehicles in this project.
@@ -734,13 +667,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         if (mounted) {
           setState(() {
             _notificationMessage =
-                '$vehicleId arrived at ${_evDisplayBlockName(blockName)} pickup point';
+                '$vehicleId arrived at $blockName pickup point';
           });
         }
 
-        NotificationService.instance.showEvArrival(
-          blockName: _evDisplayBlockName(blockName),
-        );
+        NotificationService.instance.showEvArrival(blockName: blockName);
       }
     } else {
       if (_evInsideFacultyBlockIds.remove(vehicleId)) {
@@ -788,7 +719,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   //   _evLastRouteIndex = the last stop the EV has genuinely reached.
   //   _evAtPickupStop   = whether it is still physically at that stop.
   //
-  // The EV must remain outside the 35 m pickup radius for 3 continuous
+  // The EV must remain outside the 50 m pickup radius for 3 continuous
   // seconds before _evAtPickupStop becomes false. This prevents GPS jitter
   // from instantly changing GREEN -> YELLOW.
   //
@@ -798,6 +729,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // ---------------------------------------------------------------------------
 
   CampusStop _routeStopFor(String name) {
+    if (name == 'MAB3, MAB4') {
+      // Shared MAB3/MAB4 pickup point. This is only for EV route tracking;
+      // the separate MAB3/MAB4 faculty eligibility locations are untouched.
+      const sharedPickup = LatLng(12.84406852670757, 80.15824012738847);
+      return const CampusStop(
+        name: 'MAB3, MAB4',
+        blockPosition: sharedPickup,
+        pickupPosition: sharedPickup,
+      );
+    }
+
     final normalizedName = name == 'AB2, AB4 Junction' ? 'AB2-4' : name;
 
     return EvTrackingService.campusStops.firstWhere(
@@ -813,7 +755,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   ) {
     final trackingService = EvTrackingService();
     final lastIndex = _evLastRouteIndex[vehicleId];
-    final startIndex = lastIndex ?? 0;
+
+    // On the first update, any route occurrence may be selected, but after a
+    // stop is confirmed we ONLY search later occurrences. This is critical
+    // for round trips because AB3, AB2/4 and MAB3/MAB4 occur twice.
+    final startIndex = lastIndex == null ? 0 : lastIndex + 1;
 
     for (int i = startIndex; i < routeOrder.length; i++) {
       final stop = _routeStopFor(routeOrder[i]);
@@ -833,7 +779,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final trackingService = EvTrackingService();
     final lastIndex = _evLastRouteIndex[vehicleId];
 
-    // Establish the first genuinely reached stop.
+    // First genuine pickup reached.
     if (lastIndex == null) {
       final firstMatch = _findForwardRouteMatch(
         vehicleId,
@@ -856,68 +802,57 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
 
     if (stillAtCurrentStop) {
-      // Still inside the current 35 m radius: remain GREEN and cancel any
-      // pending departure timer immediately.
-      _evDepartureTimers.remove(vehicleId)?.cancel();
+      // Still physically inside the current pickup radius. Cancel only the
+      // departure timer for THIS route occurrence.
+      final currentTimerKey = '$vehicleId:$lastIndex';
+      _evDepartureTimers.remove(currentTimerKey)?.cancel();
       _evAtPickupStop[vehicleId] = true;
       return;
     }
 
-    // Outside the current stop. Keep it GREEN until it has stayed outside
-    // continuously for 3 seconds. Importantly, do NOT advance the route state
-    // until that departure debounce has been confirmed.
+    // The EV has left the current pickup. Keep that occurrence GREEN for
+    // exactly 3 seconds, then it becomes YELLOW. We independently check for
+    // a later pickup on every Firebase update so a timer cannot miss a stop.
     _evAtPickupStop[vehicleId] = true;
 
-    if (_evDepartureTimers.containsKey(vehicleId)) return;
+    final departedIndex = lastIndex;
+    final departureTimerKey = '$vehicleId:$departedIndex';
 
-    _evDepartureTimers[vehicleId] = Timer(const Duration(seconds: 3), () {
-      _evDepartureTimers.remove(vehicleId);
-      if (!mounted) return;
+    if (!_evDepartureTimers.containsKey(departureTimerKey)) {
+      _evDepartureTimers[departureTimerKey] = Timer(
+        const Duration(seconds: 3),
+        () {
+          _evDepartureTimers.remove(departureTimerKey);
+          if (!mounted) return;
 
-      final latestLocation = _evLocations[vehicleId];
-      if (latestLocation == null) return;
+          // If the EV is still on this route occurrence, turn it yellow.
+          // If it has already reached a later occurrence, currentIndex has
+          // already made this occurrence passed/yellow.
+          if (_evLastRouteIndex[vehicleId] == departedIndex) {
+            _evAtPickupStop[vehicleId] = false;
+          }
 
-      final latestCurrentStop = _routeStopFor(routeOrder[lastIndex]);
-      final stillInside = trackingService.isEvNearStop(
-        latestLocation.position,
-        latestCurrentStop,
+          setState(() {});
+        },
       );
+    }
 
-      if (stillInside) {
-        _evAtPickupStop[vehicleId] = true;
-        return;
-      }
+    // Advance immediately when the EV physically reaches a LATER pickup.
+    // Search starts after lastIndex, so return-leg duplicates never snap back
+    // to their outbound occurrence.
+    final reachedLaterIndex = _findForwardRouteMatch(
+      vehicleId,
+      location,
+      routeOrder,
+    );
 
-      // EXACTLY here the old point becomes YELLOW: 3 seconds have elapsed
-      // outside its pickup radius.
-      _evAtPickupStop[vehicleId] = false;
+    if (reachedLaterIndex != null) {
+      _evLastRouteIndex[vehicleId] = reachedLaterIndex;
+      _evAtPickupStop[vehicleId] = true;
 
-      // The EV is allowed to SKIP stops. Once departure is confirmed,
-      // look through every later stop and advance to the furthest stop the
-      // EV is actually inside right now. This means:
-      //
-      //   MAB3/MAB4 missed -> EV reaches AB5
-      //   MAB3/MAB4 becomes YELLOW
-      //   AB5 becomes GREEN
-      //
-      // Any stops between the old index and the newly reached index are
-      // automatically rendered as passed/yellow by the metro line.
-      int? reachedLaterIndex;
-
-      for (int i = lastIndex + 1; i < routeOrder.length; i++) {
-        final laterStop = _routeStopFor(routeOrder[i]);
-        if (trackingService.isEvNearStop(latestLocation.position, laterStop)) {
-          reachedLaterIndex = i;
-        }
-      }
-
-      if (reachedLaterIndex != null) {
-        _evLastRouteIndex[vehicleId] = reachedLaterIndex;
-        _evAtPickupStop[vehicleId] = true;
-      }
-
-      setState(() {});
-    });
+      // Intentionally keep the previous timer alive. It turns the departed
+      // occurrence yellow exactly 3 seconds after departure.
+    }
   }
 
   // Returns the last confirmed route occurrence. The UI separately checks
@@ -1028,7 +963,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
     _pulseController.dispose();
     _glowController.dispose();
     _evAvailabilityTimer?.cancel();
@@ -1212,8 +1146,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               left: 12,
               right: 12,
               bottom: 10,
-              height: (MediaQuery.of(context).size.height * 0.225)
-                  .clamp(215.0, 235.0)
+              height: (MediaQuery.of(context).size.height * 0.245)
+                  .clamp(235.0, 255.0)
                   .toDouble(),
               child: _buildPilotCard(facultyBlockName, anyEvAvailable),
             ),
@@ -1243,15 +1177,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   //   - Stop at `currentIndex`       -> current/at pickup (solid green)
   //                                      ONLY while physically there
   //   - Stop at `currentIndex + 1`   -> next / approaching (blinking)
-  //   - After a 3-second confirmed departure, the former current becomes
+  //   - After a 5-second confirmed departure, the former current becomes
   //     yellow and the next stop becomes the route focus.
   //   - Everything after that        -> upcoming (neutral grey)
   //   - If `currentIndex` is null (EV online but hasn't reached its first
   //     stop yet, or nowhere near any stop at all), NOTHING is green —
   //     only stop 0 blinks as "waiting to start," rest stay grey.
   //
-  // The route is manually scrollable only. It never auto-scrolls when
-  // progress changes; the faculty user controls the horizontal position.
+  // The route is manually horizontally scrollable only. It never auto-scrolls.
 
   Widget _buildMetroLine({
     required String vehicleId,
@@ -1261,8 +1194,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final nextIndex = (currentIndex ?? -1) + 1;
     final isAtPickupStop = _evAtPickupStop[vehicleId] ?? false;
 
-    // IMPORTANT: this line is intentionally NOT auto-scrolled.
-    // The faculty user can manually swipe it horizontally whenever needed.
+    // IMPORTANT: no controller and no post-frame auto-scroll here. The
+    // faculty user controls the horizontal position manually.
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14),
       child: _buildGlassContainer(
@@ -1312,7 +1245,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       isNext: isNext,
                     );
 
-                    // EV route labels use the explicit JUNCTION wording.
                     final stopLabel = routeOrder[i] == 'AB2, AB4 Junction'
                         ? 'AB2, AB4\nJUNCTION'
                         : routeOrder[i] == 'MAB3, MAB4'
@@ -1442,12 +1374,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           final glow = 8.0 + (_glowController.value * 8.0);
           final alpha = 0.35 + (_glowController.value * 0.30);
           return Container(
-            width: 13,
-            height: 13,
+            width: 15,
+            height: 15,
             decoration: BoxDecoration(
               color: vitGreen,
               shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 1.5),
+              border: Border.all(color: Colors.white, width: 2),
               boxShadow: [
                 BoxShadow(
                   color: vitGreen.withValues(alpha: alpha),
@@ -1591,7 +1523,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       color: Colors.transparent,
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
-        onTap: _requestLocationFromMapButton,
+        onTap: () {
+          final pos = _facultyPosition;
+          if (pos != null) {
+            _mapController.move(pos, 17.0);
+          } else {
+            _mapController.move(vitChennai, 16.2);
+          }
+        },
         child: _buildGlassContainer(
           padding: const EdgeInsets.all(12),
           child: const Icon(
@@ -1611,8 +1550,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   List<Marker> _buildMarkers() {
     final markers = <Marker>[];
 
-    // Pickup points. MAB3 and MAB4 use one shared pickup point.
-    // EvTrackingService.pickupPoints already contains that shared point once.
+    // Pickup points. MAB3 and MAB4 now use one shared pickup point.
+    // Pickup points.
+    // MAB3 and MAB4 already share one pickup coordinate inside
+    // EvTrackingService.pickupPoints, so every pickup point is added once.
     for (final pickup in EvTrackingService.pickupPoints) {
       markers.add(_buildPickupMarker(pickup));
     }
@@ -1640,7 +1581,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // Standard Google-Maps-style pin using Flutter's built-in Material icon,
   // in a muted/dulled red so it doesn't overpower the map visually.
   bool _isEvNearPickupPoint(LatLng pickupPosition) {
-    const radiusMeters = 35.0;
+    const radiusMeters = EvTrackingService.evTriggerRadiusMeters;
 
     for (final location in _evLocations.values) {
       final distance = Geolocator.distanceBetween(
@@ -2096,20 +2037,9 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final index = online
         ? (_currentRouteIndex(vehicleId, location, routeOrder) ?? -1)
         : -1;
-    String current = '-';
-
-    if (online && index >= 0 && index < routeOrder.length) {
-      final currentStop = _routeStopFor(routeOrder[index]);
-      final isInsideCurrentPickup = EvTrackingService().isEvNearStop(
-        location.position,
-        currentStop,
-      );
-
-      if (isInsideCurrentPickup) {
-        current = routeOrder[index];
-      }
-    }
-
+    final current = online && index >= 0 && index < routeOrder.length
+        ? routeOrder[index]
+        : '—';
     final next = online && index >= 0 && index + 1 < routeOrder.length
         ? routeOrder[index + 1]
         : '—';
@@ -2279,7 +2209,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       Text(
                         facultyBlockName == 'Not assigned'
                             ? 'Your pickup point: Not assigned'
-                            : 'Your pickup point: ${_displayBlockName(facultyBlockName)}',
+                            : 'Your pickup point: $facultyBlockName',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
