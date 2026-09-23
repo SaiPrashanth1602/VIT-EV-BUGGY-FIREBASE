@@ -24,12 +24,11 @@ class EvTrackingService {
 
   static const double ab1EligibilityRadiusMeters = 75.0;
   static const double ab3EligibilityRadiusMeters = 75.0;
-  static const double mab3EligibilityRadiusMeters = 25.0;
-  static const double mab4EligibilityRadiusMeters = 25.0;
+  static const double mab34EligibilityRadiusMeters = 75.0;
   static const double ab5EligibilityRadiusMeters = 50.0;
   static const double ab24EligibilityRadiusMeters = 115.0;
 
-  static const double evTriggerRadiusMeters = 35.0;
+  static const double evTriggerRadiusMeters = 50.0;
 
   // ---------------------------------------------------------------------------
   // PICKUP LOCATIONS
@@ -41,10 +40,9 @@ class EvTrackingService {
     12.843668573583829,
     80.15643177150962,
   );
-  static const LatLng mab3Pickup = LatLng(12.8437876689543, 80.15813367748207);
-  static const LatLng mab4Pickup = LatLng(
-    12.844349384460841,
-    80.15834657729486,
+  static const LatLng mab34Pickup = LatLng(
+    12.84406852670757,
+    80.15824012738847,
   );
   static const LatLng ab5Pickup = LatLng(12.84136735419787, 80.15522444785671);
 
@@ -74,14 +72,9 @@ class EvTrackingService {
       pickupPosition: ab24Pickup,
     ),
     CampusStop(
-      name: 'MAB3',
+      name: 'MAB3, MAB4',
       blockPosition: mab3Block,
-      pickupPosition: mab3Pickup,
-    ),
-    CampusStop(
-      name: 'MAB4',
-      blockPosition: mab4Block,
-      pickupPosition: mab4Pickup,
+      pickupPosition: mab34Pickup,
     ),
     CampusStop(name: 'AB5', blockPosition: ab5Block, pickupPosition: ab5Pickup),
   ];
@@ -90,8 +83,7 @@ class EvTrackingService {
     ab1Pickup,
     ab3Pickup,
     ab24Pickup,
-    mab3Pickup,
-    mab4Pickup,
+    mab34Pickup,
     ab5Pickup,
   ];
 
@@ -99,8 +91,7 @@ class EvTrackingService {
     'AB1',
     'AB3',
     'AB2-4',
-    'MAB3',
-    'MAB4',
+    'MAB3, MAB4',
     'AB5',
   ];
 
@@ -349,10 +340,8 @@ class EvTrackingService {
         return ab3EligibilityRadiusMeters;
       case 'AB2-4':
         return ab24EligibilityRadiusMeters;
-      case 'MAB3':
-        return mab3EligibilityRadiusMeters;
-      case 'MAB4':
-        return mab4EligibilityRadiusMeters;
+      case 'MAB3, MAB4':
+        return mab34EligibilityRadiusMeters;
       case 'AB5':
         return ab5EligibilityRadiusMeters;
       default:
@@ -365,7 +354,6 @@ class EvTrackingService {
     for (final stop in campusStops) {
       final eligibilityRadius = _eligibilityRadiusForStop(stop);
 
-      // Special check for combined AB2-4 boundary
       if (stop.name == 'AB2-4') {
         final distanceToEligibilityCenter = distanceBetween(
           facultyPosition,
@@ -375,10 +363,23 @@ class EvTrackingService {
         if (distanceToEligibilityCenter <= eligibilityRadius) {
           return stop;
         }
+
         continue;
       }
 
-      // Standard check against block position and pickup position
+      if (stop.name == 'MAB3, MAB4') {
+        final distanceToSharedPickup = distanceBetween(
+          facultyPosition,
+          mab34Pickup,
+        );
+
+        if (distanceToSharedPickup <= eligibilityRadius) {
+          return stop;
+        }
+
+        continue;
+      }
+
       final distanceToBlock = distanceBetween(
         facultyPosition,
         stop.blockPosition,
@@ -400,12 +401,17 @@ class EvTrackingService {
 
   /// Checks if EV buggy has arrived within trigger distance of a stop
   bool isEvNearStop(LatLng evPosition, CampusStop stop) {
-    // Arrival/glow logic must use ONLY the actual pickup point.
-    // The building/block coordinate is used for faculty eligibility and
-    // must never make a stop glow when the EV is still elsewhere.
-    final distanceToPickup =
-        distanceBetween(evPosition, stop.pickupPosition);
+    if (stop.name == 'MAB3, MAB4') {
+      final distanceToSharedPickup = distanceBetween(evPosition, mab34Pickup);
 
-    return distanceToPickup <= evTriggerRadiusMeters;
+      return distanceToSharedPickup <= evTriggerRadiusMeters;
+    }
+
+    final distanceToBlock = distanceBetween(evPosition, stop.blockPosition);
+
+    final distanceToPickup = distanceBetween(evPosition, stop.pickupPosition);
+
+    return distanceToBlock <= evTriggerRadiusMeters ||
+        distanceToPickup <= evTriggerRadiusMeters;
   }
 }
