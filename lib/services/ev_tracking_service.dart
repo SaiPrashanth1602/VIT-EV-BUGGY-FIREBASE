@@ -34,30 +34,30 @@ class EvTrackingService {
   // PICKUP LOCATIONS
   // ---------------------------------------------------------------------------
 
-  static const LatLng ab1Pickup = LatLng(12.844326005876631, 80.15326191418521);
-  static const LatLng ab3Pickup = LatLng(12.844538118695052, 80.15486733537958);
+  static const LatLng ab1Pickup = LatLng(12.844320050033737, 80.15321542509439);
+  static const LatLng ab3Pickup = LatLng(12.844452411177361, 80.15494598103292);
   static const LatLng ab24Pickup = LatLng(
-    12.843668573583829,
-    80.15643177150962,
+    12.843580459657005,
+    80.15652861011469,
   );
   static const LatLng mab34Pickup = LatLng(
-    12.84406852670757,
-    80.15824012738847,
+    12.844029947440452,
+    80.15821563912993,
   );
-  static const LatLng ab5Pickup = LatLng(12.84136735419787, 80.15522444785671);
+  static const LatLng ab5Pickup = LatLng(12.841296225476189, 80.15524398004365);
 
   // ---------------------------------------------------------------------------
   // BUILDING BLOCK LOCATIONS
   // ---------------------------------------------------------------------------
 
   static const LatLng ab1Block = LatLng(12.84391293192312, 80.15342317676296);
-  static const LatLng ab2Block = LatLng(12.843120555928554, 80.15645139066287);
+  static const LatLng ab2Block = LatLng(12.842965676351705, 80.15656361351446);
   static const LatLng ab3Block = LatLng(12.844043686792524, 80.15474014135296);
   static const LatLng ab4Block = LatLng(12.843127357629559, 80.1554401593973);
   static const LatLng adbBlock = LatLng(12.840719876775859, 80.15393816088053);
-  static const LatLng mab3Block = LatLng(12.843767571559695, 80.15830467978871);
-  static const LatLng mab4Block = LatLng(12.84418012520221, 80.15850155316652);
-  static const LatLng ab5Block = LatLng(12.84099011726808, 80.15540376140352);
+  static const LatLng mab3Block = LatLng(12.843708313760125, 80.15829158252951);
+  static const LatLng mab4Block = LatLng(12.844090241442476, 80.15844174531847);
+  static const LatLng ab5Block = LatLng(12.84136169021823, 80.15597722373914);
 
   // ---------------------------------------------------------------------------
   // CAMPUS STOPS DEFINITION
