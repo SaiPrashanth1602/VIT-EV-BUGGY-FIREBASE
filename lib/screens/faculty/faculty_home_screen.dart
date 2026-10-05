@@ -141,6 +141,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // Per-EV departure debounce timers.
   final Map<String, Timer> _evDepartureTimers = {};
 
+  // Rolling speed samples used only for ETA. Keeping recent samples avoids
+  // ETA jumping around because of one noisy instantaneous GPS speed value.
+  final Map<String, List<double>> _evRecentSpeeds = {};
+  static const int _etaSpeedSampleCount = 10;
+
   // Horizontal controllers for the two permanent metro strips.
 
   String? _facultyBlockName;
@@ -159,6 +164,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     MapEntry('AB3', EvTrackingService.ab3Block),
     MapEntry('AB2', EvTrackingService.ab2Block),
     MapEntry('AB4', EvTrackingService.ab4Block),
+    MapEntry('ADB', EvTrackingService.adbBlock),
     MapEntry('MAB3', EvTrackingService.mab3Block),
     MapEntry('MAB4', EvTrackingService.mab4Block),
     MapEntry('AB5', EvTrackingService.ab5Block),
@@ -471,6 +477,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       return;
     }
 
+    final speedSamples = _evRecentSpeeds.putIfAbsent(
+      location.vehicleId,
+      () => <double>[],
+    );
+    if (location.speed >= 0 && location.speed.isFinite) {
+      speedSamples.add(location.speed);
+      if (speedSamples.length > _etaSpeedSampleCount) {
+        speedSamples.removeAt(0);
+      }
+    }
+
     setState(() {
       _evLocations[location.vehicleId] = location;
     });
@@ -494,6 +511,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
 
     _evMovingStable.remove(vehicleId);
+    _evRecentSpeeds.remove(vehicleId);
     final timersToCancel = _evDepartureTimers.keys
         .where((key) => key.startsWith('$vehicleId:'))
         .toList();
@@ -580,6 +598,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
 
     _evMovingStable.clear();
+    _evRecentSpeeds.clear();
     _evLastRouteIndex.clear();
     _evAtPickupStop.clear();
     for (final timer in _evDepartureTimers.values) {
@@ -606,14 +625,21 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   // ---------------------------------------------------------------------------
 
   bool _vehicleServesFacultyBlock(String vehicleId, String blockName) {
+    // EvTrackingService uses AB2-4 for the combined physical pickup, while
+    // the timetable uses AB2, AB4 Junction. Normalize only for schedule
+    // matching; the displayed faculty block name stays unchanged.
+    final normalizedBlockName = blockName == 'AB2-4'
+        ? 'AB2, AB4 Junction'
+        : blockName;
+
     switch (vehicleId) {
       case 'EV1':
-        return _ev1OutboundByBlock.containsKey(blockName) ||
-            _ev1ReturnByBlock.containsKey(blockName);
+        return _ev1OutboundByBlock.containsKey(normalizedBlockName) ||
+            _ev1ReturnByBlock.containsKey(normalizedBlockName);
 
       case 'EV2':
-        return _ev2OutboundByBlock.containsKey(blockName) ||
-            _ev2ReturnByBlock.containsKey(blockName);
+        return _ev2OutboundByBlock.containsKey(normalizedBlockName) ||
+            _ev2ReturnByBlock.containsKey(normalizedBlockName);
 
       default:
         // Only EV1 and EV2 are valid shuttle vehicles in this project.
@@ -973,6 +999,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     _facultyLocationService.dispose();
 
     _evProvider.stop();
+    _evRecentSpeeds.clear();
     NotificationService.instance.cancelEvArrival();
 
     super.dispose();
@@ -2028,21 +2055,179 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Current must only show a stop while the EV is physically inside a
+  // pickup-point radius. This deliberately checks PICKUP points only; it does
+  // not reuse isEvNearStop(), because that method also accepts block positions.
+  bool _isEvInsideAnyPickupPoint(LatLng position) {
+    for (final pickup in EvTrackingService.pickupPoints) {
+      final distanceMeters = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        pickup.latitude,
+        pickup.longitude,
+      );
+
+      if (distanceMeters <= EvTrackingService.evTriggerRadiusMeters) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  double _distanceMeters(LatLng a, LatLng b) {
+    return Geolocator.distanceBetween(
+      a.latitude,
+      a.longitude,
+      b.latitude,
+      b.longitude,
+    );
+  }
+
+  // ETA follows the SAME fixed metro-line sequence shown to the faculty.
+  // It does NOT mean "EV -> next stop". It means:
+  //
+  //   current EV position
+  //        -> next route stop
+  //        -> next route stop
+  //        -> ...
+  //        -> the faculty's pickup stop
+  //
+  // Example for EV1 when the faculty is waiting at AB1 and EV1 is currently
+  // at AB3 (route index 1):
+  //   AB3 -> AB2/AB4 -> MAB3/MAB4 -> AB2/AB4 -> AB3 -> AB1
+  //
+  // This deliberately uses the route-order pickup-to-pickup distances, so
+  // the ETA follows the metro-line logic rather than a direct straight-line
+  // distance to the faculty.
+
+  String _etaBlockName(String blockName) {
+    if (blockName == 'AB2-4') return 'AB2, AB4 Junction';
+    return blockName;
+  }
+
+  int? _findNextFacultyRouteIndex(
+    String facultyBlockName,
+    List<String> routeOrder,
+    int currentIndex,
+  ) {
+    final target = _etaBlockName(facultyBlockName);
+    if (target == 'Not assigned') return null;
+
+    // If the EV is already physically at the faculty stop, ETA is zero.
+    if (currentIndex >= 0 &&
+        currentIndex < routeOrder.length &&
+        routeOrder[currentIndex] == target) {
+      return currentIndex;
+    }
+
+    // Search ONLY forward from the EV's current metro-line position. This is
+    // what makes repeated stops work correctly on the return leg.
+    for (int i = math.max(0, currentIndex + 1); i < routeOrder.length; i++) {
+      if (routeOrder[i] == target) return i;
+    }
+
+    return null;
+  }
+
+  double _metroDistanceToFaculty(
+    EvLocation location,
+    List<String> routeOrder,
+    int currentIndex,
+    int targetIndex,
+  ) {
+    if (targetIndex == currentIndex) return 0;
+    if (currentIndex < 0 || currentIndex >= routeOrder.length)
+      return double.nan;
+    if (targetIndex <= currentIndex || targetIndex >= routeOrder.length) {
+      return double.nan;
+    }
+
+    // First leg is from the EV's LIVE position to the next stop in the metro
+    // line. Every following leg is the distance between consecutive pickup
+    // points in the exact route order.
+    double total = _distanceMeters(
+      location.position,
+      _routeStopFor(routeOrder[currentIndex + 1]).pickupPosition,
+    );
+
+    for (int i = currentIndex + 1; i < targetIndex; i++) {
+      final from = _routeStopFor(routeOrder[i]).pickupPosition;
+      final to = _routeStopFor(routeOrder[i + 1]).pickupPosition;
+      total += _distanceMeters(from, to);
+    }
+
+    return total;
+  }
+
+  String _etaToFacultyBlock(
+    String vehicleId,
+    EvLocation? location,
+    List<String> routeOrder,
+    int currentIndex,
+    String facultyBlockName,
+  ) {
+    if (location == null ||
+        currentIndex < 0 ||
+        currentIndex >= routeOrder.length ||
+        facultyBlockName == 'Not assigned') {
+      return '—';
+    }
+
+    final targetIndex = _findNextFacultyRouteIndex(
+      facultyBlockName,
+      routeOrder,
+      currentIndex,
+    );
+    if (targetIndex == null) return '—';
+    if (targetIndex == currentIndex) return '<1 min';
+
+    final speeds = _evRecentSpeeds[vehicleId] ?? const <double>[];
+    final validSpeeds = speeds.where((speed) => speed.isFinite && speed > 0.2);
+    if (validSpeeds.isEmpty) return '—';
+
+    final speedList = validSpeeds.toList();
+    final averageSpeedMs = speedList.reduce((a, b) => a + b) / speedList.length;
+
+    final distanceMeters = _metroDistanceToFaculty(
+      location,
+      routeOrder,
+      currentIndex,
+      targetIndex,
+    );
+    if (!distanceMeters.isFinite || distanceMeters < 0) return '—';
+
+    final etaMinutes = distanceMeters / averageSpeedMs / 60.0;
+    if (!etaMinutes.isFinite || etaMinutes < 0) return '—';
+    if (etaMinutes < 1) return '<1 min';
+    return '${etaMinutes.ceil()} min';
+  }
+
   Widget _buildEvStatusCard(
     String vehicleId,
     EvLocation? location,
     List<String> routeOrder,
+    String facultyBlockName,
   ) {
     final online = location != null;
     final index = online
         ? (_currentRouteIndex(vehicleId, location, routeOrder) ?? -1)
         : -1;
-    final current = online && index >= 0 && index < routeOrder.length
+    final physicallyInsidePickup =
+        online && _isEvInsideAnyPickupPoint(location.position);
+    final current =
+        physicallyInsidePickup && index >= 0 && index < routeOrder.length
         ? routeOrder[index]
-        : '—';
+        : '-';
     final next = online && index >= 0 && index + 1 < routeOrder.length
         ? routeOrder[index + 1]
         : '—';
+    final eta = _etaToFacultyBlock(
+      vehicleId,
+      location,
+      routeOrder,
+      index,
+      facultyBlockName,
+    );
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -2109,6 +2294,17 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           Text(
             'Next: $next',
             maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.grey.shade600,
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            'ETA: $eta',
+            maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: Colors.grey.shade600,
@@ -2237,6 +2433,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       'EV1',
                       _evLocations['EV1'],
                       _ev1RouteOrder,
+                      facultyBlockName,
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -2245,6 +2442,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                       'EV2',
                       _evLocations['EV2'],
                       _ev2RouteOrder,
+                      facultyBlockName,
                     ),
                   ),
                 ],
