@@ -144,12 +144,120 @@ class LocationService {
         permission == LocationPermission.whileInUse;
   }
 
+  Future<bool> _endExpiredShiftIfNeeded(String selectedVehicleId) async {
+    final reference = _vehiclesReference.child(selectedVehicleId);
+
+    try {
+      final snapshot = await reference.get().timeout(networkTimeout);
+
+      if (!snapshot.exists || snapshot.value is! Map) {
+        return true;
+      }
+
+      final data = Map<String, dynamic>.from(snapshot.value as Map);
+
+      if (data['active'] != true) {
+        return true;
+      }
+
+      final startedAt = DateTime.tryParse(
+        data['shiftStartedAt']?.toString() ?? '',
+      )?.toUtc();
+
+      // Never end an active shift when its start time is missing or invalid.
+      if (startedAt == null) {
+        return true;
+      }
+
+      final now = DateTime.now().toUtc();
+      if (now.difference(startedAt) < maximumShiftDuration) {
+        return true;
+      }
+
+      final expectedStartedAt = startedAt.toIso8601String();
+
+      final result = await reference
+          .runTransaction((Object? currentData) {
+            if (currentData is! Map) {
+              return Transaction.abort();
+            }
+
+            final current = Map<String, dynamic>.from(currentData);
+
+            if (current['active'] != true) {
+              return Transaction.success(current);
+            }
+
+            final currentStartedAt = DateTime.tryParse(
+              current['shiftStartedAt']?.toString() ?? '',
+            )?.toUtc();
+
+            // Do not end a newer shift that may have started after our read.
+            if (currentStartedAt == null ||
+                currentStartedAt.toIso8601String() != expectedStartedAt) {
+              return Transaction.abort();
+            }
+
+            final transactionNow = DateTime.now().toUtc();
+            if (transactionNow.difference(currentStartedAt) <
+                maximumShiftDuration) {
+              return Transaction.abort();
+            }
+
+            current.addAll({
+              'active': false,
+              'status': 'ENDED',
+              'driverId': null,
+              'connectionState': 'DISCONNECTED',
+              'updatedAt': transactionNow.toIso8601String(),
+            });
+
+            return Transaction.success(current);
+          }, applyLocally: false)
+          .timeout(networkTimeout);
+
+      if (result.committed) {
+        // Record the automatic END event, but do not fail the vehicle release
+        // if only this history write fails. The vehicle state is already ENDED.
+        try {
+          await _database
+              .ref('evShuttle/shiftEvents')
+              .push()
+              .set({
+                'vehicleId': selectedVehicleId,
+                'status': 'ENDED',
+                'reason': 'AUTO_EXPIRED',
+                'timestamp': now.toIso8601String(),
+              })
+              .timeout(networkTimeout);
+        } catch (eventError) {
+          print('EXPIRED SHIFT EVENT ERROR: $eventError');
+        }
+      }
+
+      return result.committed;
+    } catch (error) {
+      print('EXPIRED SHIFT CHECK ERROR: $error');
+      return false;
+    }
+  }
+
   Future<bool> claimVehicle(String selectedVehicleId) async {
     if (!vehicleIds.contains(selectedVehicleId)) return false;
 
     final reference = _vehiclesReference.child(selectedVehicleId);
     final currentDriverId = await _getDriverId();
+
     try {
+      // If an old shift survived because the driver app was killed, explicitly
+      // END that expired shift first. We do not use a "stale/reclaim" state.
+      final expiredCheck = await _endExpiredShiftIfNeeded(selectedVehicleId);
+      if (!expiredCheck) {
+        _lastErrorMessage =
+            'Unable to verify the EV shift status. Please check your internet connection and try again.';
+        return false;
+      }
+
       final result = await reference
           .runTransaction((Object? currentData) {
             final data = currentData is Map
@@ -158,19 +266,19 @@ class LocationService {
 
             final active = data['active'] == true;
 
-            // An active EV cannot be claimed by another shift until END SHIFT.
-            // Closing the app or clearing Recents must not release the vehicle.
+            // An active EV cannot be claimed while its 30-minute shift is still running.
             if (active) {
               return Transaction.abort();
             }
 
+            final now = DateTime.now().toUtc().toIso8601String();
             data.addAll({
               'vehicleId': selectedVehicleId,
               'active': true,
               'status': 'STARTED',
               'driverId': currentDriverId,
-              'shiftStartedAt': DateTime.now().toUtc().toIso8601String(),
-              'lastSeen': DateTime.now().toUtc().toIso8601String(),
+              'shiftStartedAt': now,
+              'lastSeen': now,
               'connectionState': 'CONNECTED',
             });
 
