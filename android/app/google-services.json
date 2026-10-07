@@ -1,0 +1,87 @@
+{
+  "project_info": {
+    "project_number": "1026100229431",
+    "firebase_url": "https://vit-ev-buggy-demo-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "vit-ev-buggy-demo",
+    "storage_bucket": "vit-ev-buggy-demo.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1026100229431:android:cb601c8382f626f68a16b2",
+        "android_client_info": {
+          "package_name": "com.example.vit_ev_buggy"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDT9bg0cn0RqEdqOeENNB8YUjfL35qo_j8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1026100229431:android:87418fb9e008b5408a16b2",
+        "android_client_info": {
+          "package_name": "com.example.vit_ev_buggy_admin"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDT9bg0cn0RqEdqOeENNB8YUjfL35qo_j8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1026100229431:android:d9a20dd16b2b96b68a16b2",
+        "android_client_info": {
+          "package_name": "com.vit.evbuggy.driver"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDT9bg0cn0RqEdqOeENNB8YUjfL35qo_j8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1026100229431:android:7b88333796a0d9668a16b2",
+        "android_client_info": {
+          "package_name": "com.vit.evbuggy.faculty"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDT9bg0cn0RqEdqOeENNB8YUjfL35qo_j8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
