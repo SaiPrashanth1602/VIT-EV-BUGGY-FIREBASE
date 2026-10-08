@@ -16,6 +16,7 @@ import '../../services/ev_tracking_service.dart';
 import '../../services/faculty_location_service.dart';
 import '../../services/notification_service.dart';
 
+/// Main faculty screen for viewing live EV locations, pickup alerts, and shuttle details.
 class FacultyHomeScreen extends StatefulWidget {
   const FacultyHomeScreen({super.key});
 
@@ -25,7 +26,7 @@ class FacultyHomeScreen extends StatefulWidget {
 
 class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     with TickerProviderStateMixin {
-  // ── Official shuttle schedule (VIT Chennai timetable) ──────────────────────
+  // Shuttle times in minutes after midnight, grouped by pickup block.
   static const Map<String, List<int>> _ev1OutboundByBlock = {
     'AB1': [468, 523, 578, 633, 688, 743, 828, 883, 938],
     'AB3': [470, 525, 580, 635, 690, 745, 830, 885, 940],
@@ -54,21 +55,13 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     'AB3': [548, 603, 658, 713, 768, 908, 962],
   };
 
-  // ── Metro-style route order per vehicle — FULL round trip ────────────────
-  // Real routes are there-and-back: the EV drives out to the turnaround
-  // stop, then drives the SAME stops in reverse back to the start. This
-  // list spells out every stop in both legs (turnaround appears once), so
-  // the progress line can correctly show the return leg instead of going
-  // blank after the last outbound stop. Purely a UI concept for the
-  // progress-line indicator below — does not affect scheduling, arrival
-  // notifications, or any Firebase/location logic elsewhere.
-  // MAB3 + MAB4 share ONE physical EV pickup point.
-  // The following points stay in the same route order for both EVs.
+  // Route order used only for the top progress bars.
+  // Repeated stops are expected because the EV returns along the same route.
   static const List<String> _ev1RouteOrder = [
     'AB1',
     'AB3',
     'AB2, AB4 Junction',
-    'MAB3, MAB4', // turnaround
+    'MAB3, MAB4',
     'AB2, AB4 Junction',
     'AB3',
     'AB1',
@@ -78,13 +71,15 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     'AB3',
     'AB2, AB4 Junction',
     'MAB3, MAB4',
-    'AB5', // turnaround
+    'AB5',
     'MAB3, MAB4',
     'AB2, AB4 Junction',
     'AB3',
   ];
 
-  // ── Brand Colors & Map Constants ──────────────────────────────────────────
+  /// Shared map and brand values used across route overlays, markers, and status
+  /// widgets. They are kept together here so the screen's visual language remains
+  /// consistent without leaking map-specific constants into lower-level services.
   static const Color vitBlue = Color(0xFF0F2C56);
   static const Color vitBlueLight = Color(0xFF1A4A7A);
   static const Color vitGreen = Color(0xFF16A34A);
@@ -92,71 +87,67 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   static const Color routeYellow = Color(0xFFFACC15);
   static const LatLng vitChennai = LatLng(12.8406, 80.1534);
 
-  // Muted/dull red for pickup pins — less saturated than Colors.red so it
-  // doesn't overpower the map visually.
   static const Color pickupPinColor = Color(0xFFB33A3A);
 
+  // Controls the campus map and recenters it on the faculty user when needed.
   final MapController _mapController = MapController();
 
+  // Uses Firebase for live EV updates on supported mobile devices.
+  // Uses an empty fallback provider when Firebase tracking is not available.
   late final EvLocationProvider _evProvider =
       (Platform.isAndroid || Platform.isIOS) && Firebase.apps.isNotEmpty
       ? EvApiProvider()
       : const NoopEvLocationProvider();
 
+  // Gets the faculty user's GPS location.
   late final FacultyLocationService _facultyLocationService;
 
+  // Keeps track of live EV updates, faculty GPS updates, and the EV status check.
   StreamSubscription<EvLocation>? _evSubscription;
   StreamSubscription<Position>? _facultyLocationSubscription;
 
   Timer? _evAvailabilityTimer;
 
+  /// Current faculty position and block assignment used for map centering, UI
+  /// state, and personal arrival checks. It is refreshed by the location stream.
   LatLng? _facultyPosition;
 
-  // Multi-vehicle state: every currently-active/online EV, keyed by its
-  // vehicleId (e.g. "EV1", "EV2"). Each EvLocation already carries its own
-  // `heading` field straight from Firebase, which the direction arrows
-  // below read directly — no changes to this logic.
+  // Latest location for each online EV.
+  // EV1 and EV2 are kept separate, so one offline EV does not hide the other.
   final Map<String, EvLocation> _evLocations = {};
 
-  // Tracks per-block "arrival" state per vehicle, so EV1 and EV2 arriving
-  // at the same block independently trigger their own notifications.
+  // Remembers which EVs are already at the faculty user's pickup point.
+  // This stops the same arrival alert from appearing repeatedly.
   final Set<String> _evInsideFacultyBlockIds = {};
 
-  // UI-only debounce: smooths the moving/idle flag used purely for the
-  // direction-arrow animation, so GPS speed jitter right at the threshold
-  // doesn't flicker the arrows on/off. Does NOT affect any EV location,
-  // arrival, or notification logic elsewhere in this file.
+  // Keeps movement arrows from flickering when GPS speed changes slightly.
   final Map<String, bool> _evMovingStable = {};
 
-  // UI-only: remembers the last stop genuinely reached by each EV.
-  // This is used only for route continuity; the metro line itself glows
-  // ONLY when the EV is physically inside the current pickup-point radius.
+  // Last confirmed route stop for each EV.
+  // This prevents repeated return-trip stops from jumping back to an earlier stop.
   final Map<String, int> _evLastRouteIndex = {};
 
-  // True only while the EV is physically inside its currently confirmed
-  // pickup-point radius. A 5-second departure debounce prevents GPS jitter
-  // from immediately changing the stop from green to yellow.
+  // Tracks whether each EV is still inside its current pickup-point area.
   final Map<String, bool> _evAtPickupStop = {};
 
-  // Per-EV departure debounce timers.
+  // Gives a short delay before marking an EV as departed, avoiding GPS flicker.
   final Map<String, Timer> _evDepartureTimers = {};
 
-  // Rolling speed samples used for ETA. Speed from Firebase is m/s.
+  // Keeps recent speed readings for each EV.
   final Map<String, List<double>> _evRecentSpeeds = {};
 
-  // Horizontal controllers for the two permanent metro strips.
-
+  // Faculty location and notification state used by the map and alerts.
   String? _facultyBlockName;
   String? _notificationMessage;
 
   bool _locationAvailable = false;
   bool _hasInitialMapCentered = false;
 
+  // Used only for map and route animations. They do not change tracking logic.
   late AnimationController _pulseController;
   late AnimationController _glowController;
 
-  // Named campus blocks, reused for both the map markers and the
-  // "EV at any block" pickup-point check below.
+  // Campus block markers shown on the map.
   static const List<MapEntry<String, LatLng>> _campusBlocks = [
     MapEntry('AB1', EvTrackingService.ab1Block),
     MapEntry('AB3', EvTrackingService.ab3Block),
@@ -168,6 +159,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   ];
 
   @override
+  // Starts animations, location services, and live EV tracking when this screen opens.
   void initState() {
     super.initState();
 
@@ -185,6 +177,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     _initialize();
   }
 
+  // Refreshes EV locations manually using the same logic as live updates.
   Future<void> _refreshEvStatus() async {
     try {
       final locations = await _evProvider.fetchCurrentLocations();
@@ -203,12 +196,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
   }
 
+  // Prepares notifications, starts EV tracking, and starts faculty GPS tracking.
   Future<void> _initialize() async {
     await NotificationService.instance.initialize();
 
     try {
-      // IMPORTANT:
-      // Subscribe BEFORE starting the provider.
+      // Listen before starting the provider so the first EV update is not missed.
       _evSubscription = _evProvider.locationStream.listen(
         _handleEvLocation,
         onError: (error) {
@@ -232,7 +225,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
   }
 
-  // ── Timetable Logic Functions ──────────────────────────────────────────────
+  // Changes timetable minutes into a readable AM/PM time.
   String _formatScheduleTime(int minutes) {
     final hour24 = minutes ~/ 60;
     final minute = minutes % 60;
@@ -246,10 +239,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return now.hour * 60 + now.minute;
   }
 
-  // Direction label is now blank for outbound trips ('TO CLASS' removed).
-  // 'RETURN' trips keep their label so the two directions stay distinct.
+  // Outbound trips have no extra label. Return trips show "RETURN".
   static const String _outboundDirectionLabel = '';
 
+  // Finds the next scheduled EV for the selected pickup block.
   _ScheduleEntry? _nextScheduledShuttle(String blockName) {
     final now = _currentMinutes();
     final candidates = <_ScheduleEntry>[];
@@ -312,6 +305,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return candidates.first;
   }
 
+  // Returns the next few shuttle times for the selected pickup block.
   List<_ScheduleEntry> _upcomingSchedule(String blockName) {
     final now = _currentMinutes();
     final entries = <_ScheduleEntry>[];
@@ -342,12 +336,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return entries.take(5).toList();
   }
 
-  // ---------------------------------------------------------------------------
-  // FACULTY LOCATION
-  // ---------------------------------------------------------------------------
-
+  /// Checks location services and permission before starting faculty GPS tracking.
   Future<void> _startFacultyLocation() async {
     try {
+      // GPS must be enabled to find the faculty user's pickup block.
       final serviceEnabled = await _facultyLocationService
           .isLocationServiceEnabled();
 
@@ -386,7 +378,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         }
       }
 
-      final updatedPermission = await _facultyLocationService
+        // Check again because the user may have changed the permission.
+        final updatedPermission = await _facultyLocationService
           .getPermissionStatus();
 
       if (updatedPermission == LocationPermission.deniedForever) {
@@ -410,6 +403,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         return;
       }
 
+      // Start GPS updates after location access is allowed.
       final started = await _facultyLocationService.startTracking();
 
       if (!started) {
@@ -419,7 +413,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
       if (mounted) setState(() => _locationAvailable = true);
 
-      final initialPosition = await _facultyLocationService
+        // Use the first location immediately instead of waiting for the next stream update.
+        final initialPosition = await _facultyLocationService
           .getCurrentPosition();
       if (initialPosition != null) {
         _handleFacultyPosition(initialPosition);
@@ -427,11 +422,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
       _facultyLocationSubscription ??= _facultyLocationService.locationStream
           .listen(_handleFacultyPosition, onError: (_) {});
-    } catch (_) {
-      // Location plugin fallback logic.
-    }
+    } catch (_) {}
   }
 
+  // Updates the faculty marker and finds the user's nearby pickup block.
   void _handleFacultyPosition(Position position) {
     final facultyPosition = LatLng(position.latitude, position.longitude);
     final facultyStop = EvTrackingService().findFacultyBlock(facultyPosition);
@@ -444,31 +438,28 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _facultyBlockName = facultyStop?.name;
     });
 
+    // Center the map only once so later GPS updates do not fight manual map movement.
     if (!_hasInitialMapCentered) {
       _hasInitialMapCentered = true;
       _mapController.move(facultyPosition, 16.8);
     }
 
     if (facultyStop != null) {
+      // Check all current EVs again after the user's block changes.
       for (final location in _evLocations.values) {
         _checkEvArrival(facultyPosition, facultyStop, location);
       }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // EV LOCATION (FIREBASE REALTIME STREAM) — MULTI-VEHICLE
-  // (UNCHANGED — same logic as before)
-  // ---------------------------------------------------------------------------
-
+  // Handles one live EV update from Firebase or manual refresh.
   void _handleEvLocation(EvLocation location) {
     if (!mounted) return;
 
     final now = DateTime.now().toUtc();
+    // Ignore old updates so an offline EV does not stay on the map.
     final isStale = now.difference(location.timestamp).inSeconds > 180;
 
-    // A stale update for THIS vehicle only removes that vehicle, not the
-    // others — e.g. if EV2 goes quiet, EV1's marker must stay untouched.
     if (isStale) {
       _removeEvLocation(location.vehicleId);
       return;
@@ -486,12 +477,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       }
     }
 
+    // Save the latest location for this EV only.
     setState(() {
       _evLocations[location.vehicleId] = location;
     });
-
-    // Runs for every faculty user regardless of their own block, checked
-    // against every currently known vehicle.
 
     if (_facultyPosition == null) return;
 
@@ -501,6 +490,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     _checkEvArrival(_facultyPosition!, facultyStop, location);
   }
 
+  // Removes one offline or stale EV without affecting the others.
   void _removeEvLocation(String vehicleId) {
     if (!mounted) return;
 
@@ -508,6 +498,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       _evLocations.remove(vehicleId);
     });
 
+    // Clear old route and animation state so this EV starts fresh next time.
     _evMovingStable.remove(vehicleId);
     final timersToCancel = _evDepartureTimers.keys
         .where((key) => key.startsWith('$vehicleId:'))
@@ -518,10 +509,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     _evAtPickupStop.remove(vehicleId);
     _evRecentSpeeds.remove(vehicleId);
 
-    // Vehicle went offline (shift ended) — drop its remembered route
-    // position so the NEXT time it comes online (new shift), the metro
-    // line starts a completely fresh lap from index 0 instead of
-    // carrying over wherever it left off last time.
     _evLastRouteIndex.remove(vehicleId);
 
     if (_evInsideFacultyBlockIds.remove(vehicleId) &&
@@ -535,10 +522,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // EV AVAILABILITY CHECK (UNCHANGED)
-  // ---------------------------------------------------------------------------
-
+  // Checks every few seconds for EVs that disappeared from fresh Firebase data.
   void _startEvAvailabilityCheck() {
     _evAvailabilityTimer?.cancel();
 
@@ -572,8 +556,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
           }
         }
 
-        // Drop any vehicle we're currently showing that isn't in the
-        // fresh active list anymore (per-vehicle offline detection).
+        // Remove EVs that are no longer in the latest active list.
         final staleIds = _evLocations.keys
             .where((id) => !activeIds.contains(id))
             .toList();
@@ -581,12 +564,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         for (final id in staleIds) {
           _removeEvLocation(id);
         }
-      } catch (_) {
-        // Soft fail protection
-      }
+      } catch (_) {}
     });
   }
 
+  // Clears all EV markers and alerts when no live EV data is available.
   void _clearAllEvLocations() {
     if (!mounted) return;
 
@@ -608,20 +590,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     NotificationService.instance.cancelEvArrival();
   }
 
-  // ---------------------------------------------------------------------------
-  // EV ARRIVAL / GEOFENCING
-  //
-  // IMPORTANT:
-  // A faculty member must ONLY be notified by a vehicle that actually serves
-  // their pickup block.
-  //
-  // Example:
-  //   Faculty at AB1 + EV1 inside AB1 radius -> NOTIFY
-  //   Faculty at AB1 + EV2 inside AB1 radius -> DO NOT NOTIFY
-  //
-  // The physical 50 m geofence is still checked by EvTrackingService.
-  // ---------------------------------------------------------------------------
-
+  // Checks whether this EV actually serves the faculty user's pickup block.
   bool _vehicleServesFacultyBlock(String vehicleId, String blockName) {
     switch (vehicleId) {
       case 'EV1':
@@ -633,11 +602,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
             _ev2ReturnByBlock.containsKey(blockName);
 
       default:
-        // Only EV1 and EV2 are valid shuttle vehicles in this project.
         return false;
     }
   }
 
+  // Shows an arrival alert only when an EV reaches the faculty user's pickup point.
   void _checkEvArrival(
     LatLng facultyPosition,
     CampusStop facultyStop,
@@ -647,16 +616,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final vehicleId = evLocation.vehicleId;
     final blockName = facultyStop.name;
 
-    // First enforce the route assignment.
-    //
-    // This prevents an EV from another route from notifying a faculty member
-    // simply because both vehicles can physically pass through/near the same
-    // pickup coordinate.
+    // Do not alert for an EV that does not serve this pickup block.
     final vehicleServesBlock = _vehicleServesFacultyBlock(vehicleId, blockName);
 
     if (!vehicleServesBlock) {
-      // If this vehicle was previously considered inside the faculty block,
-      // clear only its arrival state. It must never create a notification.
       if (_evInsideFacultyBlockIds.remove(vehicleId) &&
           _evInsideFacultyBlockIds.isEmpty) {
         if (mounted) {
@@ -671,7 +634,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       return;
     }
 
-    // Route is valid, now perform the exact physical pickup-point geofence.
     final evNear = trackingService.isEvNearStop(
       evLocation.position,
       facultyStop,
@@ -679,6 +641,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     if (evNear) {
       if (!_evInsideFacultyBlockIds.contains(vehicleId)) {
+        // Alert only once when this EV enters the pickup area.
         _evInsideFacultyBlockIds.add(vehicleId);
 
         if (mounted) {
@@ -694,8 +657,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       if (_evInsideFacultyBlockIds.remove(vehicleId)) {
         if (mounted) {
           setState(() {
-            // Only clear the banner if no other valid vehicle is still inside.
             if (_evInsideFacultyBlockIds.isEmpty) {
+              // Keep the alert visible if another EV is still at the pickup point.
               _notificationMessage = null;
             }
           });
@@ -708,47 +671,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // METRO-STYLE ROUTE PROGRESS — pure UI, read-only, computed on every build
-  // ---------------------------------------------------------------------------
-  //
-  // Finds which stop (by index into the FULL round-trip route list) the
-  // given EV is currently nearest/at, reusing the exact same `isEvNearStop`
-  // geofence check already used for arrival notifications.
-  //
-  // IMPORTANT: this only ever returns an index when a REAL match happens.
-  // If the EV isn't near ANY stop right now (e.g. still driving from its
-  // depot, or — as in testing — nowhere near campus at all), this returns
-  // whatever was last genuinely confirmed (or null if nothing ever was).
-  // It never guesses/defaults to index 0 — that was the earlier bug that
-  // made a stop show green before the EV had actually reached it.
-  //
-  // Because the round-trip list repeats stop names (e.g. MAB3 appears once
-  // outbound and once on the return leg), matching searches forward from
-  // the last confirmed index first, so later matches correctly resolve to
-  // the RETURN-leg occurrence instead of snapping back to the outbound one.
-
-  // ---------------------------------------------------------------------------
-  // ROUTE PROGRESS STATE
-  //
-  // There are two different states:
-  //
-  //   _evLastRouteIndex = the last stop the EV has genuinely reached.
-  //   _evAtPickupStop   = whether it is still physically at that stop.
-  //
-  // The EV must remain outside the 50 m pickup radius for 3 continuous
-  // seconds before _evAtPickupStop becomes false. This prevents GPS jitter
-  // from instantly changing GREEN -> YELLOW.
-  //
-  // Route indices are always resolved FORWARD from the last confirmed index.
-  // This is critical because MAB3, AB2/4 and AB3 occur twice on the round
-  // trip. We must never jump back to the outbound occurrence on the return.
-  // ---------------------------------------------------------------------------
-
+  // Matches a route label to the campus stop used for route progress checks.
   CampusStop _routeStopFor(String name) {
+    // MAB3 and MAB4 use one shared pickup point for route progress.
     if (name == 'MAB3, MAB4') {
-      // Shared MAB3/MAB4 pickup point. This is only for EV route tracking;
-      // the separate MAB3/MAB4 faculty eligibility locations are untouched.
       const sharedPickup = LatLng(12.84406852670757, 80.15824012738847);
       return const CampusStop(
         name: 'MAB3, MAB4',
@@ -765,6 +691,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Searches only ahead in the route so return trips do not jump backward.
   int? _findForwardRouteMatch(
     String vehicleId,
     EvLocation location,
@@ -773,9 +700,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final trackingService = EvTrackingService();
     final lastIndex = _evLastRouteIndex[vehicleId];
 
-    // On the first update, any route occurrence may be selected, but after a
-    // stop is confirmed we ONLY search later occurrences. This is critical
-    // for round trips because AB3, AB2/4 and MAB3/MAB4 occur twice.
     final startIndex = lastIndex == null ? 0 : lastIndex + 1;
 
     for (int i = startIndex; i < routeOrder.length; i++) {
@@ -788,6 +712,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return null;
   }
 
+  // Updates the route bar using real pickup-point matches from the live EV location.
   void _updateRouteState(
     String vehicleId,
     EvLocation location,
@@ -796,7 +721,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final trackingService = EvTrackingService();
     final lastIndex = _evLastRouteIndex[vehicleId];
 
-    // First genuine pickup reached.
+    // Do not guess a starting stop. Wait until the EV reaches a real pickup point.
     if (lastIndex == null) {
       final firstMatch = _findForwardRouteMatch(
         vehicleId,
@@ -819,21 +744,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
 
     if (stillAtCurrentStop) {
-      // Still physically inside the current pickup radius. Cancel only the
-      // departure timer for THIS route occurrence.
       final currentTimerKey = '$vehicleId:$lastIndex';
       _evDepartureTimers.remove(currentTimerKey)?.cancel();
       _evAtPickupStop[vehicleId] = true;
       return;
     }
 
-    // The EV has left the current pickup. Keep that occurrence GREEN for
-    // exactly 3 seconds, then it becomes YELLOW.
-    //
-    // IMPORTANT: once the timer has turned this occurrence yellow, later
-    // Firebase updates while the EV is still outside the radius must NOT
-    // turn it green again. It becomes green again only after a later pickup
-    // is physically reached.
     final departedIndex = lastIndex;
     final departureTimerKey = '$vehicleId:$departedIndex';
 
@@ -843,15 +759,13 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
     if (!_evDepartureTimers.containsKey(departureTimerKey) &&
         _evAtPickupStop[vehicleId] == true) {
+      // Wait briefly before marking the EV as departed to avoid GPS flicker.
       _evDepartureTimers[departureTimerKey] = Timer(
         const Duration(seconds: 3),
         () {
           _evDepartureTimers.remove(departureTimerKey);
           if (!mounted) return;
 
-          // If the EV is still on this route occurrence, turn it yellow.
-          // If it has already reached a later occurrence, currentIndex has
-          // already made this occurrence passed/yellow.
           if (_evLastRouteIndex[vehicleId] == departedIndex) {
             _evAtPickupStop[vehicleId] = false;
           }
@@ -861,27 +775,20 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       );
     }
 
-    // Advance immediately when the EV physically reaches a LATER pickup.
-    // Search starts after lastIndex, so return-leg duplicates never snap back
-    // to their outbound occurrence.
     final reachedLaterIndex = _findForwardRouteMatch(
       vehicleId,
       location,
       routeOrder,
     );
 
+    // Move forward only when the EV reaches a later pickup point.
     if (reachedLaterIndex != null) {
       _evLastRouteIndex[vehicleId] = reachedLaterIndex;
       _evAtPickupStop[vehicleId] = true;
-
-      // Intentionally keep the previous timer alive. It turns the departed
-      // occurrence yellow exactly 3 seconds after departure.
     }
   }
 
-  // Returns the last confirmed route occurrence. The UI separately checks
-  // _evAtPickupStop to decide whether that occurrence is GREEN (still there)
-  // or YELLOW (departed).
+  // Returns the last confirmed stop for the EV route progress bar.
   int? _currentRouteIndex(
     String vehicleId,
     EvLocation location,
@@ -891,6 +798,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return _evLastRouteIndex[vehicleId];
   }
 
+  // Shows a clear message when GPS services or permission are needed.
   Future<void> _showLocationRequiredDialog({
     required String title,
     required String message,
@@ -987,6 +895,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
 
   @override
   void dispose() {
+    // Stops timers, streams, GPS tracking, and animations when leaving this screen.
     _pulseController.dispose();
     _glowController.dispose();
     _evAvailabilityTimer?.cancel();
@@ -1002,11 +911,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     super.dispose();
   }
 
-  // ---------------------------------------------------------------------------
-  // BUILD METHOD & UI COMPONENTS
-  // ---------------------------------------------------------------------------
-
   @override
+  // Builds the map, live EV markers, route bars, alerts, and bottom information panel.
   Widget build(BuildContext context) {
     final facultyBlockName = _facultyBlockName ?? 'Not assigned';
     final anyEvAvailable = _evLocations.isNotEmpty;
@@ -1033,7 +939,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
         ),
         body: Stack(
           children: [
-            // ── Map ─────────────────────────────────────────────────────────
+            // Main campus map with route lines and live markers.
             FlutterMap(
               mapController: _mapController,
               options: const MapOptions(
@@ -1049,7 +955,8 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                   userAgentPackageName: 'com.vit.evbuggy',
                 ),
                 Container(color: Colors.black.withValues(alpha: 0.18)),
-                // ── Glowing thin route lines ──────────────────────────────
+
+                // Draw the fixed shuttle route below the live markers.
                 PolylineLayer(
                   polylines: [
                     Polyline(
@@ -1064,6 +971,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                     ),
                   ],
                 ),
+                // Draw the fixed shuttle route below the live markers.
                 PolylineLayer(
                   polylines: [
                     Polyline(
@@ -1082,12 +990,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ],
             ),
 
-            // ── Metro-style route progress strips — top free space ───────────
-            // One permanent row per EV, showing its fixed round-trip stop
-            // sequence with passed/current/next/upcoming states. Purely
-            // additive, reads only from _evLocations (already-existing
-            // state) plus the isEvNearStop geofence check (already-
-            // existing logic).
+            // One route bar for each EV.
             Positioned(
               left: 0,
               right: 0,
@@ -1121,7 +1024,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ),
 
-            // ── Personal Arrival Notification Banner ─────────────────────────
+            // Personal pickup alert shown when an EV arrives.
             if (_notificationMessage != null)
               Positioned.fill(
                 child: Align(
@@ -1136,7 +1039,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 ),
               ),
 
-            // ── Pickup legend ───────────────────────────────────────────────
             Positioned(
               left: 16,
               top:
@@ -1147,7 +1049,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               child: _buildPickupLegend(),
             ),
 
-            // ── Map controls ─────────────────────────────────────────────────
             Positioned(
               right: 16,
               top:
@@ -1165,7 +1066,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               ),
             ),
 
-            // ── Fixed Shuttle Information Panel ──────────────────────────────
+            // Shows the faculty block and EV status summary.
             Positioned(
               left: 12,
               right: 12,
@@ -1181,35 +1082,14 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // Approximates how tall the metro-line area currently is, so the warning/
-  // notification banners below it shift down instead of overlapping it.
-  // Pure layout math — does not touch any EV state.
+  // Keeps map banners below the route progress bars.
   double _metroAreaHeight(EvLocation? ev1, EvLocation? ev2) {
-    // Both metro strips are permanently rendered, including when an EV is
-    // offline. Keep overlays below the same fixed two-row area at all times.
     const lineHeight = 50.0;
     const gap = 4.0;
     return (lineHeight * 2) + gap;
   }
 
-  // ---------------------------------------------------------------------------
-  // METRO-STYLE ROUTE PROGRESS WIDGET
-  // ---------------------------------------------------------------------------
-  //
-  // Renders one horizontal line for a single EV's full round-trip route:
-  //   - Stops before `currentIndex`  -> passed (dull yellow/orange)
-  //   - Stop at `currentIndex`       -> current/at pickup (solid green)
-  //                                      ONLY while physically there
-  //   - Stop at `currentIndex + 1`   -> next / approaching (blinking)
-  //   - After a 5-second confirmed departure, the former current becomes
-  //     yellow and the next stop becomes the route focus.
-  //   - Everything after that        -> upcoming (neutral grey)
-  //   - If `currentIndex` is null (EV online but hasn't reached its first
-  //     stop yet, or nowhere near any stop at all), NOTHING is green —
-  //     only stop 0 blinks as "waiting to start," rest stay grey.
-  //
-  // The route is manually horizontally scrollable only. It never auto-scrolls.
-
+  // Builds the route progress bar for one EV.
   Widget _buildMetroLine({
     required String vehicleId,
     required List<String> routeOrder,
@@ -1218,8 +1098,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final nextIndex = (currentIndex ?? -1) + 1;
     final isAtPickupStop = _evAtPickupStop[vehicleId] ?? false;
 
-    // IMPORTANT: no controller and no post-frame auto-scroll here. The
-    // faculty user controls the horizontal position manually.
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14),
       child: _buildGlassContainer(
@@ -1253,6 +1131,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: List.generate(routeOrder.length, (i) {
+                    // Green is the current stop, orange is passed, and grey is not reached yet.
                     final isCurrent = isAtPickupStop && i == currentIndex;
                     final isPassed =
                         currentIndex != null &&
@@ -1386,6 +1265,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Draws one stop dot for the route progress bar.
   Widget _buildMetroDot({
     required bool isPassed,
     required bool isCurrent,
@@ -1417,7 +1297,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       );
     }
 
-    // The next stop stays neutral until the EV physically reaches it.
     if (isNext) {
       return Container(
         width: 12,
@@ -1442,7 +1321,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       );
     }
 
-    // Upcoming / not yet relevant.
     return Container(
       width: 10,
       height: 10,
@@ -1454,10 +1332,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // GLASSMORPHISM & CONTROLS
-  // ---------------------------------------------------------------------------
-
+  // Shared frosted-card style used by map controls and route bars.
   Widget _buildGlassContainer({
     required Widget child,
     EdgeInsetsGeometry? padding,
@@ -1490,6 +1365,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Small map key for the pickup-point pins.
   Widget _buildPickupLegend() {
     return _buildGlassContainer(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
@@ -1528,6 +1404,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Button for manually refreshing live EV locations.
   Widget _buildRefreshControl() {
     return Material(
       color: Colors.transparent,
@@ -1542,6 +1419,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Button for returning the map to the faculty user's location.
   Widget _buildMapControl() {
     return Material(
       color: Colors.transparent,
@@ -1567,34 +1445,22 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // MAP MARKERS BUILDER
-  // ---------------------------------------------------------------------------
-
+  // Adds pickup points, campus blocks, the faculty user, and active EVs to the map.
   List<Marker> _buildMarkers() {
     final markers = <Marker>[];
 
-    // Pickup points. MAB3 and MAB4 now use one shared pickup point.
-    // Pickup points.
-    // MAB3 and MAB4 already share one pickup coordinate inside
-    // EvTrackingService.pickupPoints, so every pickup point is added once.
     for (final pickup in EvTrackingService.pickupPoints) {
       markers.add(_buildPickupMarker(pickup));
     }
 
-    // Block markers
     for (final block in _campusBlocks) {
       markers.add(_buildCampusMarker(position: block.value, label: block.key));
     }
 
-    // Faculty Marker (Blue User Pin)
     if (_facultyPosition != null) {
       markers.add(_buildFacultyMarker());
     }
 
-    // EV Buggy Markers — one per currently active vehicle (EV1, EV2, ...).
-    // If a vehicle goes offline, it's removed from _evLocations and its
-    // marker simply stops being added here; other vehicles are untouched.
     for (final location in _evLocations.values) {
       markers.add(_buildVehicleMarker(location));
     }
@@ -1602,8 +1468,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return markers;
   }
 
-  // Standard Google-Maps-style pin using Flutter's built-in Material icon,
-  // in a muted/dulled red so it doesn't overpower the map visually.
+  // Checks whether any active EV is close enough to make this pickup pin glow.
   bool _isEvNearPickupPoint(LatLng pickupPosition) {
     const radiusMeters = EvTrackingService.evTriggerRadiusMeters;
 
@@ -1621,8 +1486,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return false;
   }
 
-  // Pickup pin glows ONLY while an active EV is physically inside this
-  // pickup point's radius. Every pickup point is checked independently.
+  // Builds one pickup-point pin. It glows when an EV is nearby.
   Marker _buildPickupMarker(LatLng position) {
     const pinSize = 40.0;
     final evInsideRadius = _isEvNearPickupPoint(position);
@@ -1679,19 +1543,13 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // VEHICLE MARKER — EV icon + radial direction-flow chevrons
-  // (UNCHANGED FROM YOUR CURRENT VERSION — including your size/opacity edits)
-  // ---------------------------------------------------------------------------
-
+  // Builds the live marker for one EV.
   Marker _buildVehicleMarker(EvLocation location) {
     final vehicleId = location.vehicleId;
     final rawMoving = location.speed >= 1.0;
     final wasMoving = _evMovingStable[vehicleId] ?? rawMoving;
 
-    // Hysteresis purely for the arrow's visual on/off state: once moving,
-    // only flips back to "stopped" below a lower threshold, so GPS speed
-    // jitter right around 1.0 m/s can't flicker the arrows.
+    // Use two speed limits to stop direction arrows from flickering.
     final isMoving = wasMoving ? (location.speed >= 0.6) : rawMoving;
     _evMovingStable[vehicleId] = isMoving;
 
@@ -1712,15 +1570,12 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
               alignment: Alignment.center,
               clipBehavior: Clip.none,
               children: [
-                // ── Direction chevrons — radially placed around the icon
-                //    along the heading line, animating outward on a loop.
                 if (isMoving)
                   ..._buildDirectionChevrons(
                     headingRad: headingRad,
                     animationValue: _glowController.value,
                   ),
 
-                // ── EV icon — perfectly centered, untouched ─────────────
                 Container(
                   width: 52,
                   height: 52,
@@ -1752,7 +1607,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
                   ),
                 ),
 
-                // ── Vehicle label — pinned below the icon ────────────────
                 Positioned(
                   bottom: -22,
                   child: Container(
@@ -1790,11 +1644,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // Builds small chevrons along the heading direction from the icon's
-  // center, spaced at increasing radius with decreasing opacity, staggered
-  // in phase so together they read as a continuous outward flow — a subtle
-  // trailing pulse in the travel direction, always tucked right next to
-  // the icon. (UNCHANGED — retains your bigger size/opacity/radius edits.)
+  // Builds animated arrows showing the EV's heading direction.
   List<Widget> _buildDirectionChevrons({
     required double headingRad,
     required double animationValue,
@@ -1835,6 +1685,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     });
   }
 
+  // Builds the "You" marker for the faculty user's location.
   Marker _buildFacultyMarker() {
     return Marker(
       point: _facultyPosition!,
@@ -1900,6 +1751,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Builds a label marker for a campus block.
   Marker _buildCampusMarker({required LatLng position, required String label}) {
     return Marker(
       point: position,
@@ -1956,10 +1808,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // BANNERS & WARNINGS
-  // ---------------------------------------------------------------------------
-
+  // Shows the personal EV arrival message on the map.
   Widget _buildNotificationBanner() {
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),
@@ -2052,7 +1901,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-
   double _averageEvSpeedMps(String vehicleId, EvLocation? location) {
     final samples = _evRecentSpeeds[vehicleId];
     if (samples != null && samples.isNotEmpty) {
@@ -2094,9 +1942,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     int? currentIndex = _evLastRouteIndex[vehicleId];
     final atPickup = _evAtPickupStop[vehicleId] ?? false;
 
-    // Find the next occurrence of the faculty's stop along the EV's
-    // current round-trip route. If the EV is currently physically at that
-    // stop, ETA is zero.
     int? targetIndex;
     final searchStart = currentIndex == null
         ? 0
@@ -2117,9 +1962,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
       return 0;
     }
 
-    // Start from the EV's actual GPS position, then follow the ordered
-    // metro route through pickup points. This deliberately does NOT use
-    // straight-line EV -> faculty distance.
     int nextStopIndex = currentIndex == null ? 0 : currentIndex + 1;
 
     if (nextStopIndex <= targetIndex) {
@@ -2140,7 +1982,11 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return (distanceMeters / speedMps) / 60.0;
   }
 
-  String _formatEta(String vehicleId, EvLocation? location, List<String> routeOrder) {
+  String _formatEta(
+    String vehicleId,
+    EvLocation? location,
+    List<String> routeOrder,
+  ) {
     if (location == null) return 'ETA: —';
 
     final minutes = _calculateEtaMinutes(vehicleId, location, routeOrder);
@@ -2148,7 +1994,6 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     if (minutes < 0.5) return 'ETA: <1 min';
     return 'ETA: ${minutes.round()} min';
   }
-
 
   bool _isEvInsideAnyPickupPoint(LatLng position) {
     for (final pickup in EvTrackingService.pickupPoints) {
@@ -2165,6 +2010,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     return false;
   }
 
+  // Shows the current and next stop for one EV.
   Widget _buildEvStatusCard(
     String vehicleId,
     EvLocation? location,
@@ -2174,11 +2020,10 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     final index = online
         ? (_currentRouteIndex(vehicleId, location, routeOrder) ?? -1)
         : -1;
-    final physicallyInsidePickup = online &&
-        _isEvInsideAnyPickupPoint(location.position);
-    final current = physicallyInsidePickup &&
-            index >= 0 &&
-            index < routeOrder.length
+    final physicallyInsidePickup =
+        online && _isEvInsideAnyPickupPoint(location.position);
+    final current =
+        physicallyInsidePickup && index >= 0 && index < routeOrder.length
         ? routeOrder[index]
         : '-';
     final next = online && index >= 0 && index + 1 < routeOrder.length
@@ -2273,13 +2118,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // BOTTOM DRAGGABLE CARD
-  // ---------------------------------------------------------------------------
-
-  // Fixed, non-scrollable bottom panel. The panel height is controlled by
-  // the Positioned widget in build(), so the map remains stable and the
-  // information stays visible without dragging or inner scrolling.
+  // Bottom panel showing the faculty pickup block and EV status.
   Widget _buildPilotCard(String facultyBlockName, bool anyEvAvailable) {
     return Container(
       decoration: BoxDecoration(
@@ -2408,6 +2247,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Builds one row in the shuttle timetable.
   Widget _buildScheduleRow(_ScheduleEntry entry) {
     final hasDirection = entry.direction.isNotEmpty;
 
@@ -2495,6 +2335,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Message shown when no timetable entries are available.
   Widget _buildScheduleEmpty(String text) {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -2514,6 +2355,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
+  // Builds one small information row in the bottom panel.
   Widget _buildInfoRow({
     required IconData icon,
     required String label,
@@ -2551,7 +2393,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
     );
   }
 
-  // Status badge: only ONLINE or OFFLINE. No MOVING/STOPPED distinction.
+  // Shows whether at least one EV is online.
   Widget _buildStatusBadge(bool anyEvAvailable) {
     if (!anyEvAvailable) {
       return _statusChip(
@@ -2592,10 +2434,7 @@ class _FacultyHomeScreenState extends State<FacultyHomeScreen>
   }
 }
 
-// ---------------------------------------------------------------------------
-// SCHEDULE ENTRY & PAINTER HELPERS
-// ---------------------------------------------------------------------------
-
+// One timetable entry used in the shuttle schedule UI.
 class _ScheduleEntry {
   const _ScheduleEntry(
     this.vehicle,
@@ -2605,11 +2444,13 @@ class _ScheduleEntry {
   });
 
   final String vehicle;
+  // Time stored as minutes after midnight.
   final int time;
   final String direction;
   final bool tomorrow;
 }
 
+// Draws the small pointer below a campus block label.
 class _MarkerArrowPainter extends CustomPainter {
   const _MarkerArrowPainter(this.color, {this.flip = false});
 

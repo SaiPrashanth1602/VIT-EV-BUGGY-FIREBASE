@@ -1,5 +1,6 @@
 import 'package:latlong2/latlong.dart';
 
+/// Stores the name, block location, and pickup location for one shuttle stop.
 class CampusStop {
   const CampusStop({
     required this.name,
@@ -7,33 +8,35 @@ class CampusStop {
     required this.pickupPosition,
   });
 
+  /// Stop name used in the app.
   final String name;
+
+  /// Main location of the block.
   final LatLng blockPosition;
+
+  /// Pickup point where the EV stops.
   final LatLng pickupPosition;
 }
 
+/// Stores campus stop locations and checks if faculty members or EVs are near them.
 class EvTrackingService {
-  // ---------------------------------------------------------------------------
-  // ELIGIBILITY RADII & BOUNDARY CENTERS
-  // ---------------------------------------------------------------------------
-
+  // Center point used to identify faculty near the shared AB2 and AB4 area.
   static const LatLng ab24EligibilityCenter = LatLng(
     12.843032299736574,
     80.1557585034112,
   );
 
+  // Area around each block where a faculty member can be assigned to that pickup point.
   static const double ab1EligibilityRadiusMeters = 75.0;
   static const double ab3EligibilityRadiusMeters = 75.0;
   static const double mab34EligibilityRadiusMeters = 75.0;
   static const double ab5EligibilityRadiusMeters = 50.0;
   static const double ab24EligibilityRadiusMeters = 115.0;
 
+  // EV must be within this distance to count as arriving at a pickup point.
   static const double evTriggerRadiusMeters = 35.0;
 
-  // ---------------------------------------------------------------------------
-  // PICKUP LOCATIONS
-  // ---------------------------------------------------------------------------
-
+  // Actual pickup points used for EV arrival checks.
   static const LatLng ab1Pickup = LatLng(12.844320050033737, 80.15321542509439);
   static const LatLng ab3Pickup = LatLng(12.844452411177361, 80.15494598103292);
   static const LatLng ab24Pickup = LatLng(
@@ -46,10 +49,7 @@ class EvTrackingService {
   );
   static const LatLng ab5Pickup = LatLng(12.841296225476189, 80.15524398004365);
 
-  // ---------------------------------------------------------------------------
-  // BUILDING BLOCK LOCATIONS
-  // ---------------------------------------------------------------------------
-
+  // Main block locations used to identify the faculty user's nearby area.
   static const LatLng ab1Block = LatLng(12.84391293192312, 80.15342317676296);
   static const LatLng ab2Block = LatLng(12.842965676351705, 80.15656361351446);
   static const LatLng ab3Block = LatLng(12.844043686792524, 80.15474014135296);
@@ -59,10 +59,8 @@ class EvTrackingService {
   static const LatLng mab4Block = LatLng(12.844090241442476, 80.15844174531847);
   static const LatLng ab5Block = LatLng(12.84136169021823, 80.15597722373914);
 
-  // ---------------------------------------------------------------------------
-  // CAMPUS STOPS DEFINITION
-  // ---------------------------------------------------------------------------
-
+  // List of all pickup stops used for faculty block detection and EV arrival checks.
+  // Keep these names unchanged because other parts of the app use them.
   static const List<CampusStop> campusStops = [
     CampusStop(name: 'AB1', blockPosition: ab1Block, pickupPosition: ab1Pickup),
     CampusStop(name: 'AB3', blockPosition: ab3Block, pickupPosition: ab3Pickup),
@@ -79,6 +77,7 @@ class EvTrackingService {
     CampusStop(name: 'AB5', blockPosition: ab5Block, pickupPosition: ab5Pickup),
   ];
 
+  // Pickup points shown on the map. Shared pickup points are listed only once.
   static const List<LatLng> pickupPoints = [
     ab1Pickup,
     ab3Pickup,
@@ -87,6 +86,7 @@ class EvTrackingService {
     ab5Pickup,
   ];
 
+  // Names for the pickup points above. Keep both lists in the same order.
   static const List<String> pickupNames = [
     'AB1',
     'AB3',
@@ -95,10 +95,8 @@ class EvTrackingService {
     'AB5',
   ];
 
-  // ---------------------------------------------------------------------------
-  // CAMPUS ROAD PATH WAYPOINTS (DUAL ROUTE LOOPS)
-  // ---------------------------------------------------------------------------
-
+  // These points only draw the shuttle route lines on the map.
+  // They do not control EV movement, location tracking, or notifications.
   static const List<LatLng> buggyRoadYellow = [
     LatLng(12.8443161, 80.1532332),
     LatLng(12.8443444, 80.1532696),
@@ -228,6 +226,7 @@ class EvTrackingService {
     LatLng(12.8443687, 80.1583561),
   ];
 
+  // Second route line shown on the map.
   static const List<LatLng> buggyRoadOrange = [
     LatLng(12.8443535, 80.1584085),
     LatLng(12.8443001, 80.1583906),
@@ -320,18 +319,15 @@ class EvTrackingService {
     LatLng(12.8412781, 80.1552737),
   ];
 
-  // ---------------------------------------------------------------------------
-  // DISTANCE & GEOFENCING LOGIC
-  // ---------------------------------------------------------------------------
-
+  // Used to calculate distance between two map locations in metres.
   final Distance _distance = const Distance();
 
-  /// Calculates distance in meters between two coordinates
+  // Returns the distance between two locations in metres.
   double distanceBetween(LatLng first, LatLng second) {
     return _distance.as(LengthUnit.Meter, first, second);
   }
 
-  /// Resolves individual eligibility radius for each stop
+  // Returns the faculty-area radius for each pickup stop.
   double _eligibilityRadiusForStop(CampusStop stop) {
     switch (stop.name) {
       case 'AB1':
@@ -344,16 +340,19 @@ class EvTrackingService {
         return mab34EligibilityRadiusMeters;
       case 'AB5':
         return ab5EligibilityRadiusMeters;
+      // Fallback radius for an unknown stop name.
       default:
         return 50.0;
     }
   }
 
-  /// Identifies which campus stop a faculty member is located in
+  /// Finds which pickup area the faculty user is currently near.
+  /// Returns null if the user is outside all configured campus areas.
   CampusStop? findFacultyBlock(LatLng facultyPosition) {
     for (final stop in campusStops) {
       final eligibilityRadius = _eligibilityRadiusForStop(stop);
 
+      // AB2 and AB4 share one faculty-area center.
       if (stop.name == 'AB2-4') {
         final distanceToEligibilityCenter = distanceBetween(
           facultyPosition,
@@ -367,6 +366,7 @@ class EvTrackingService {
         continue;
       }
 
+      // MAB3 and MAB4 share one pickup point.
       if (stop.name == 'MAB3, MAB4') {
         final distanceToSharedPickup = distanceBetween(
           facultyPosition,
@@ -380,6 +380,7 @@ class EvTrackingService {
         continue;
       }
 
+      // For other stops, check both the block and its pickup point.
       final distanceToBlock = distanceBetween(
         facultyPosition,
         stop.blockPosition,
@@ -399,14 +400,16 @@ class EvTrackingService {
     return null;
   }
 
-  /// Checks if EV buggy has arrived within trigger distance of a stop
+  /// Checks whether an EV is close enough to a pickup point to count as arriving.
   bool isEvNearStop(LatLng evPosition, CampusStop stop) {
+    // MAB3 and MAB4 use one shared pickup point.
     if (stop.name == 'MAB3, MAB4') {
       final distanceToSharedPickup = distanceBetween(evPosition, mab34Pickup);
 
       return distanceToSharedPickup <= evTriggerRadiusMeters;
     }
 
+    // Other stops can match either the block location or the pickup location.
     final distanceToBlock = distanceBetween(evPosition, stop.blockPosition);
 
     final distanceToPickup = distanceBetween(evPosition, stop.pickupPosition);
