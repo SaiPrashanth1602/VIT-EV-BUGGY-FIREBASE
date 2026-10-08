@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import '../../models/shift_session.dart';
 import '../../services/admin_shift_service.dart';
 
+/// Admin dashboard for viewing EV shift history and live shift status.
 class AdminHomeScreen extends StatefulWidget {
   const AdminHomeScreen({super.key});
 
@@ -14,48 +15,61 @@ class AdminHomeScreen extends StatefulWidget {
 }
 
 class _AdminHomeScreenState extends State<AdminHomeScreen> {
+  // Main colors used by the Admin dashboard.
   static const Color _navyBlue = Color(0xFF0F2C56);
   static const Color _green = Color(0xFF16A34A);
   static const Color _background = Color(0xFFF5F7FA);
 
+  // Reads EV shift sessions from Firebase.
   final AdminShiftService _shiftService = AdminShiftService();
 
+  // Keeps the live Firebase shift listener so it can be stopped safely.
   StreamSubscription<List<ShiftSession>>? _shiftSubscription;
 
+  // Date currently shown in the shift history.
   DateTime _selectedDate = _dateOnly(DateTime.now());
 
+  // Screen state for loading, errors, and all shift sessions received from Firebase.
   bool _isLoading = true;
   String? _errorMessage;
   List<ShiftSession> _allSessions = const [];
 
+  // Start listening for live shift updates when this screen opens.
   @override
   void initState() {
     super.initState();
     _startShiftStream();
   }
 
+  // Stop the Firebase shift listener when leaving this screen.
   @override
   void dispose() {
     _shiftSubscription?.cancel();
     super.dispose();
   }
 
+  // Removes the time part so dates can be compared day by day.
   static DateTime _dateOnly(DateTime value) {
     return DateTime(value.year, value.month, value.day);
   }
 
+  // Listens for live shift updates from Firebase.
   void _startShiftStream() {
+    // Stop an older listener before starting a new one.
     _shiftSubscription?.cancel();
 
+    // Show loading while waiting for the first Firebase update.
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
 
+    // Update the dashboard automatically when shift data changes.
     _shiftSubscription = _shiftService.watchAllShiftSessions().listen(
       (sessions) {
         if (!mounted) return;
 
+        // Save the latest sessions and refresh the screen.
         setState(() {
           _allSessions = sessions;
           _isLoading = false;
@@ -65,6 +79,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
       onError: (Object error) {
         if (!mounted) return;
 
+        // Show an error message if live shift data cannot be read.
         setState(() {
           _errorMessage = error.toString();
           _isLoading = false;
@@ -73,10 +88,10 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
-  /// Manual refresh remains useful as a fallback. In normal usage,
-  /// Firebase pushes changes automatically through [_shiftSubscription].
+  // Manually refreshes shift data if needed.
   Future<void> _loadSessions() async {
     try {
+      // Read the latest shift sessions once from Firebase.
       final sessions = await _shiftService.fetchAllShiftSessions();
 
       if (!mounted) return;
@@ -89,6 +104,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     } catch (error) {
       if (!mounted) return;
 
+      // Show the error if manual refresh fails.
       setState(() {
         _errorMessage = error.toString();
         _isLoading = false;
@@ -96,6 +112,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     }
   }
 
+  // Returns shifts for one EV on the selected date.
   List<ShiftSession> _sessionsForVehicle(String vehicleId) {
     return _allSessions.where((session) {
       return session.vehicleId == vehicleId &&
@@ -103,14 +120,17 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     }).toList();
   }
 
+  // Checks whether two dates are on the same calendar day.
   bool _isSameDate(DateTime first, DateTime second) {
     return first.year == second.year &&
         first.month == second.month &&
         first.day == second.day;
   }
 
+  // True when the Admin screen is showing today's shift history.
   bool get _isTodaySelected => _isSameDate(_selectedDate, DateTime.now());
 
+  // Text shown for the currently selected date.
   String get _selectedDateLabel {
     if (_isTodaySelected) {
       return 'Today, ${DateFormat('dd MMM yyyy').format(_selectedDate)}';
@@ -119,6 +139,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     return DateFormat('EEEE, dd MMM yyyy').format(_selectedDate);
   }
 
+  // Opens the calendar so the admin can view another day's shifts.
   Future<void> _pickDate() async {
     final pickedDate = await showDatePicker(
       context: context,
@@ -135,14 +156,17 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     });
   }
 
+  // Returns the dashboard to today's shift history.
   void _showToday() {
     setState(() {
       _selectedDate = _dateOnly(DateTime.now());
     });
   }
 
+  // Builds the Admin dashboard for the selected date.
   @override
   Widget build(BuildContext context) {
+    // Keep EV1 and EV2 shift history separate on the dashboard.
     final ev1Sessions = _sessionsForVehicle('EV1');
     final ev2Sessions = _sessionsForVehicle('EV2');
 
@@ -219,6 +243,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Shows the selected date and opens the calendar when needed.
   Widget _buildDateSelector() {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -303,12 +328,14 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Shows total shifts and the number of ongoing shifts for this date.
   Widget _buildSummaryRow(
     List<ShiftSession> ev1Sessions,
     List<ShiftSession> ev2Sessions,
   ) {
     final totalShifts = ev1Sessions.length + ev2Sessions.length;
 
+    // Count unfinished shifts as currently live.
     final ongoingCount = [
       ...ev1Sessions,
       ...ev2Sessions,
@@ -337,6 +364,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Small card used for dashboard totals.
   Widget _buildSummaryCard({
     required IconData icon,
     required String label,
@@ -390,11 +418,13 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Shows one EV's shifts for the selected date.
   Widget _buildVehicleSection({
     required String vehicleId,
     required List<ShiftSession> sessions,
     required Color color,
   }) {
+    // An EV is live when it has a shift with no end time yet.
     final isLive = sessions.any((session) => session.isOngoing);
 
     return Container(
@@ -485,6 +515,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Small LIVE or OFFLINE label for an EV.
   Widget _buildStatusChip({
     required String label,
     required Color color,
@@ -508,6 +539,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Message shown when this EV has no shifts on the selected date.
   Widget _buildNoShiftState() {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 26, horizontal: 16),
@@ -533,11 +565,13 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Shows start time, end time or ongoing status, and total shift duration.
   Widget _buildShiftRow({
     required ShiftSession session,
     required Color color,
     required bool showDivider,
   }) {
+    // Convert saved UTC times to the device's local time for display.
     final localStart = session.startTime.toLocal();
     final localEnd = session.endTime?.toLocal();
 
@@ -623,6 +657,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Small start or end time section inside a shift row.
   Widget _buildTimeColumn({
     required String label,
     required String value,
@@ -660,6 +695,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Changes a shift duration into a short readable format.
   String _formatDuration(Duration duration) {
     final hours = duration.inHours;
     final minutes = duration.inMinutes.remainder(60);
@@ -675,6 +711,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     return '${hours}h ${minutes}m';
   }
 
+  // Reminder that pull-to-refresh can also update the dashboard.
   Widget _buildFooter() {
     return Center(
       child: Text(
@@ -689,6 +726,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
     );
   }
 
+  // Error screen shown when shift history cannot be loaded.
   Widget _buildErrorState() {
     return Center(
       child: Padding(
