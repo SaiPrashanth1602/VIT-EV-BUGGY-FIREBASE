@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../services/location_service.dart';
 
+// Driver UI for EV selection, shift control and live tracking status.
 class DriverHomeScreen extends StatefulWidget {
   const DriverHomeScreen({super.key});
 
@@ -22,16 +23,12 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
   bool _shiftActive = false;
   bool _isProcessing = false;
 
-  // Temporary pilot value.
-  // Final backend integration will identify the driver
-  // and allocate one of EV1-EV2 as the active tracking slot.
   String? _activeVehicleId;
   String? _selectedVehicleId;
 
-  // Temporary pilot value.
-  // Final app will obtain the driver's identity from authentication.
   final String _driverName = 'Driver';
 
+  // Initializes Firebase/location callbacks and restores an existing driver shift.
   @override
   void initState() {
     super.initState();
@@ -60,6 +57,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     super.dispose();
   }
 
+  // Restores an active EV shift after the app is reopened or recreated.
   Future<void> _restoreExistingShift() async {
     if (Firebase.apps.isEmpty) {
       return;
@@ -68,8 +66,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     try {
       String? vehicleId;
 
-      // Firebase can take a short moment to reconnect after the app is
-      // reopened, so try more than once before deciding that no shift exists.
+      // Retries Firebase shift lookup to handle temporary connection delays.
       for (int attempt = 1; attempt <= 3; attempt++) {
         vehicleId = await _locationService.findExistingShift();
         debugPrint(
@@ -85,8 +82,6 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 
       if (!mounted || vehicleId == null) return;
 
-      // Update the UI as soon as Firebase confirms the active shift.
-      // GPS reconnection must not control whether the shift card is shown.
       setState(() {
         _shiftActive = true;
         _activeVehicleId = vehicleId;
@@ -94,6 +89,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
         _isProcessing = true;
       });
 
+      // Restarts GPS tracking for the previously active EV.
       final restored = await _locationService.restoreTracking(vehicleId);
 
       if (!mounted) return;
@@ -119,6 +115,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
   }
 
+  // Starts a new driver shift after an EV is selected.
   Future<void> _startShift() async {
     if (_isProcessing || _shiftActive) {
       return;
@@ -133,6 +130,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
       _isProcessing = true;
     });
 
+    // Claims the selected EV and starts live GPS tracking through LocationService.
     final started = await _locationService
         .startTracking(_selectedVehicleId!)
         .timeout(const Duration(seconds: 12), onTimeout: () => false);
@@ -159,6 +157,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
   }
 
+  // Ends the active shift and stops live EV location tracking.
   Future<void> _endShift() async {
     if (_isProcessing || !_shiftActive) {
       return;
@@ -169,6 +168,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     });
 
     try {
+      // Stops GPS tracking and releases the EV through LocationService.
       await _locationService.stopTracking().timeout(
         const Duration(seconds: 12),
       );
@@ -195,6 +195,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 
   bool _isNetworkConnected = true;
 
+  // Updates the Driver UI when the 30-minute shift is automatically ended.
   void _handleShiftAutoEnded() {
     if (!mounted) return;
     setState(() {
@@ -206,6 +207,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     _showMessage('Your shift ended automatically after 30 minutes.');
   }
 
+  // Updates the UI when Firebase connectivity changes during an active shift.
   void _handleConnectionChanged(bool connected) {
     if (!mounted) return;
 
@@ -222,6 +224,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     }
   }
 
+  // Shows the driver when network connectivity is lost during an active shift.
   Widget _buildNetworkStatusBanner() {
     if (_isNetworkConnected || !_shiftActive) {
       return const SizedBox.shrink();
@@ -431,6 +434,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
             ),
           ),
           const SizedBox(height: 24),
+          // Only EV1 and EV2 are available for driver allocation.
           DropdownButtonFormField<String>(
             value: _selectedVehicleId,
             decoration: InputDecoration(
@@ -464,6 +468,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     );
   }
 
+  // Displays the currently active EV and confirms that live tracking is running.
   Widget _buildActiveShiftCard() {
     return _buildGlassCard(
       child: Column(
@@ -616,6 +621,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     );
   }
 
+  // Provides the manual control for ending the active driver shift.
   Widget _buildEndShiftButton() {
     return SizedBox(
       width: double.infinity,

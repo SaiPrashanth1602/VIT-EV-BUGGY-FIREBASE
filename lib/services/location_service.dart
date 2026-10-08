@@ -1,3 +1,6 @@
+// VIT EV BUGGY Driver location service.
+// Handles GPS tracking, EV allocation, Firebase updates and shift lifecycle.
+
 import 'dart:async';
 import 'dart:io' show Platform;
 
@@ -25,6 +28,7 @@ class LocationService {
   static const String _deviceIdKey = 'ev_shuttle_driver_device_id';
   String? _resolvedDriverId;
 
+  // Stores a persistent device-specific driver ID using SharedPreferences.
   Future<String> _getDriverId() async {
     if (_resolvedDriverId != null) return _resolvedDriverId!;
     final preferences = await SharedPreferences.getInstance();
@@ -38,6 +42,7 @@ class LocationService {
     return savedId;
   }
 
+  // Driver configuration: EV1/EV2, 30-minute shifts and Firebase heartbeat.
   static const Duration heartbeatInterval = Duration(seconds: 30);
   static const Duration maximumShiftDuration = Duration(minutes: 30);
   static const Duration networkTimeout = Duration(seconds: 8);
@@ -64,6 +69,7 @@ class LocationService {
       );
     }
 
+    // Firebase Realtime Database shared by Driver, Faculty and Admin apps.
     _databaseInstance ??= FirebaseDatabase.instanceFor(
       app: app,
       databaseURL:
@@ -73,9 +79,11 @@ class LocationService {
     return _databaseInstance!;
   }
 
+  // evShuttle/vehicles stores the live state and location of EV1 and EV2.
   DatabaseReference get _vehiclesReference =>
       _database.ref('evShuttle/vehicles');
 
+  // Uses Firebase .info/connected to monitor Realtime Database connectivity.
   Future<bool> _isRealtimeDatabaseConnected() async {
     if (Firebase.apps.isEmpty) {
       return false;
@@ -92,6 +100,7 @@ class LocationService {
     }
   }
 
+  // Reads Firebase with a timeout to avoid waiting indefinitely on network failure.
   Future<DataSnapshot?> _safeReadSnapshot(
     DatabaseReference reference, {
     Duration timeout = const Duration(seconds: 3),
@@ -115,6 +124,7 @@ class LocationService {
     }
   }
 
+  // Checks that device location services and required GPS permissions are available.
   Future<bool> checkAndRequestPermission() async {
     _lastErrorMessage = null;
 
@@ -144,6 +154,7 @@ class LocationService {
         permission == LocationPermission.whileInUse;
   }
 
+  // Recovers stale Firebase shifts that have exceeded the 30-minute limit.
   Future<bool> _endExpiredShiftIfNeeded(String selectedVehicleId) async {
     final reference = _vehiclesReference.child(selectedVehicleId);
 
@@ -164,7 +175,6 @@ class LocationService {
         data['shiftStartedAt']?.toString() ?? '',
       )?.toUtc();
 
-      // Never end an active shift when its start time is missing or invalid.
       if (startedAt == null) {
         return true;
       }
@@ -176,6 +186,7 @@ class LocationService {
 
       final expectedStartedAt = startedAt.toIso8601String();
 
+      // Transaction safely updates the EV only if the existing shift is still unchanged.
       final result = await reference
           .runTransaction((Object? currentData) {
             if (currentData is! Map) {
@@ -192,7 +203,6 @@ class LocationService {
               current['shiftStartedAt']?.toString() ?? '',
             )?.toUtc();
 
-            // Do not end a newer shift that may have started after our read.
             if (currentStartedAt == null ||
                 currentStartedAt.toIso8601String() != expectedStartedAt) {
               return Transaction.abort();
@@ -217,8 +227,6 @@ class LocationService {
           .timeout(networkTimeout);
 
       if (result.committed) {
-        // Record the automatic END event, but do not fail the vehicle release
-        // if only this history write fails. The vehicle state is already ENDED.
         try {
           await _database
               .ref('evShuttle/shiftEvents')
@@ -242,6 +250,7 @@ class LocationService {
     }
   }
 
+  // Atomically claims EV1 or EV2 so two drivers cannot claim the same EV.
   Future<bool> claimVehicle(String selectedVehicleId) async {
     if (!vehicleIds.contains(selectedVehicleId)) return false;
 
@@ -249,8 +258,6 @@ class LocationService {
     final currentDriverId = await _getDriverId();
 
     try {
-      // If an old shift survived because the driver app was killed, explicitly
-      // END that expired shift first. We do not use a "stale/reclaim" state.
       final expiredCheck = await _endExpiredShiftIfNeeded(selectedVehicleId);
       if (!expiredCheck) {
         _lastErrorMessage =
@@ -266,7 +273,6 @@ class LocationService {
 
             final active = data['active'] == true;
 
-            // An active EV cannot be claimed while its 30-minute shift is still running.
             if (active) {
               return Transaction.abort();
             }
@@ -299,10 +305,12 @@ class LocationService {
     }
   }
 
+  // Starts a new driver shift and claims the selected EV.
   Future<bool> startTracking(String selectedVehicleId) async {
     return _activateTracking(selectedVehicleId, claim: true);
   }
 
+  // Restores an existing active shift belonging to this device.
   Future<bool> restoreTracking(String existingVehicleId) async {
     if (_isTracking) return true;
     return _activateTracking(existingVehicleId, claim: false);
@@ -330,10 +338,9 @@ class LocationService {
     try {
       final currentDriverId = await _getDriverId();
       if (claim) {
+        // Records the shift start for Admin shift history.
         await sendShiftEvent(vehicleId: _vehicleId!, status: 'STARTED');
       } else {
-        // Reconnect an already active shift without creating a new STARTED event
-        // or changing the existing shift state.
         await _vehiclesReference
             .child(_vehicleId!)
             .update({
@@ -380,6 +387,7 @@ class LocationService {
 
       print('STARTING LOCATION STREAM FOR $_vehicleId');
 
+      // Configures continuous GPS tracking for the active EV.
       _positionSubscription =
           Geolocator.getPositionStream(
             locationSettings: _getPlatformLocationSettings(
@@ -402,8 +410,6 @@ class LocationService {
       _lastErrorMessage ??=
           'Unable to connect to the server. Please check your internet connection and try again.';
       print('START TRACKING ERROR: $error');
-      // Never end an existing shift just because reconnecting failed.
-      // Only a deliberate END SHIFT should release the vehicle.
       if (claim) {
         await releaseVehicleSlot(_vehicleId);
       }
@@ -414,11 +420,13 @@ class LocationService {
     }
   }
 
+  // Validates GPS data before accepting and sending a vehicle position.
   Future<void> _handlePosition(Position position) async {
     if (!_isTracking || _vehicleId == null) return;
 
     final vehicleId = _vehicleId!;
 
+    // Rejects inaccurate GPS readings.
     if (position.accuracy > maxAcceptableAccuracy) {
       print('REJECTED: Low accuracy fix (${position.accuracy}m)');
       return;
@@ -432,6 +440,7 @@ class LocationService {
         position.longitude,
       );
 
+      // Ignores tiny movements caused by GPS jitter.
       if (distanceMoved < minMovementThreshold) {
         return;
       }
@@ -445,6 +454,7 @@ class LocationService {
       if (timeDeltaSeconds > 0) {
         final calculatedSpeed = distanceMoved / timeDeltaSeconds;
 
+        // Rejects unrealistic GPS speed spikes.
         if (calculatedSpeed > maxBuggySpeedMetersPerSecond) {
           print('REJECTED: Impossible speed spike ($calculatedSpeed m/s)');
           return;
@@ -472,6 +482,7 @@ class LocationService {
     return defaultSettings;
   }
 
+  // Monitors Firebase connectivity while the driver shift is active.
   void _startConnectionMonitor() {
     _connectionSubscription?.cancel();
     _connectionSubscription = _database
@@ -494,6 +505,7 @@ class LocationService {
         );
   }
 
+  // Schedules automatic shift termination from the Firebase shift start time.
   Future<void> _scheduleShiftExpiry(String vehicleId) async {
     _shiftExpiryTimer?.cancel();
 
@@ -525,6 +537,7 @@ class LocationService {
     });
   }
 
+  // Periodically refreshes lastSeen and connection state while the shift is active.
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) async {
@@ -539,6 +552,7 @@ class LocationService {
     });
   }
 
+  // Firebase onDisconnect marks the vehicle disconnected after unexpected loss.
   Future<void> _registerDisconnectHandler(String vehicleId) async {
     await _vehiclesReference
         .child(vehicleId)
@@ -547,6 +561,7 @@ class LocationService {
         .timeout(networkTimeout);
   }
 
+  // Finds an active EV shift belonging to this device for shift restoration.
   Future<String?> findExistingShift() async {
     final currentDriverId = await _getDriverId();
     for (final vehicleId in vehicleIds) {
@@ -567,8 +582,6 @@ class LocationService {
         'driverId=${data['driverId']}',
       );
 
-      // Firebase data shown by your app contains active=true and status=ACTIVE.
-      // Accept ACTIVE and STARTED so reopening works during either phase.
       final recordDriverId = data['driverId']?.toString();
       final belongsToThisPhone = recordDriverId == currentDriverId;
 
@@ -582,6 +595,7 @@ class LocationService {
     return null;
   }
 
+  // Ends the shift, stops local tracking and records the END event.
   Future<void> stopTracking() async {
     if (!_isTracking) return;
 
@@ -606,6 +620,7 @@ class LocationService {
     }
   }
 
+  // Releases the EV so it can be allocated to another driver.
   Future<void> releaseVehicleSlot(String? vehicleId) async {
     if (vehicleId == null) return;
 
@@ -620,6 +635,7 @@ class LocationService {
         .timeout(networkTimeout);
   }
 
+  // Sends validated live EV location and operational state to Firebase.
   Future<void> sendLocation({
     required String vehicleId,
     required Position position,
@@ -644,6 +660,7 @@ class LocationService {
         .timeout(networkTimeout);
   }
 
+  // Stores STARTED/ENDED shift events used by the Admin application.
   Future<void> sendShiftEvent({
     required String vehicleId,
     required String status,
@@ -654,10 +671,7 @@ class LocationService {
     await _vehiclesReference.child(vehicleId).update({
       'vehicleId': vehicleId,
       'status': status,
-
-      // Active for STARTED and other non-ended states.
       'active': status != 'ENDED',
-
       'driverId': status == 'ENDED' ? null : currentDriverId,
       'lastSeen': timestamp,
       'connectionState': status == 'ENDED' ? 'DISCONNECTED' : 'CONNECTED',
