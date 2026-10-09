@@ -76,17 +76,13 @@ The goal is to support clearer shuttle visibility for faculty, a straightforward
 
 ### 📸 The EV Buggy on Campus
 
-> **Photo placeholder:** Replace this image with a photograph of the actual VIT EV buggy taken on campus.
-
 <div align="center">
 
-![VIT EV Buggy on campus — replace with an actual project photograph](docs/images/vit-ev-buggy.jpg)
+![VIT EV Buggy on campus](docs/images/vit-ev-buggy.jpg)
 
-<sub>VIT Chennai EV Buggy · Actual campus photograph to be added</sub>
+<sub>VIT Chennai EV Buggy</sub>
 
 </div>
-
-Place the photo at `docs/images/vit-ev-buggy.jpg`, or update the image path above to match your chosen filename.
 
 ---
 
@@ -134,8 +130,6 @@ Place the photo at `docs/images/vit-ev-buggy.jpg`, or update the image path abov
 
 ## 🖼️ Application Showcase
 
-> **UI screenshot placeholders:** Add app screenshots to `docs/screenshots/` using the filenames below. The previews will appear once the image files are added to the repository.
-
 ### 🚗 Driver App
 
 | Start Shift | Active Shift |
@@ -153,22 +147,6 @@ Place the photo at `docs/images/vit-ev-buggy.jpg`, or update the image path abov
 | Shift Dashboard | Shift History |
 |:---:|:---:|
 | ![Admin Dashboard](docs/screenshots/admin-dashboard.png) | ![Admin Shift History](docs/screenshots/admin-history.png) |
-
-Suggested assets structure:
-
-```text
-docs/
-├── images/
-│   └── vit-ev-buggy.jpg
-└── screenshots/
-    ├── driver-start.png
-    ├── driver-active.png
-    ├── faculty-map.png
-    ├── faculty-map-2.png
-    ├── faculty-arrival.png
-    ├── admin-dashboard.png
-    └── admin-history.png
-```
 
 ---
 
@@ -270,8 +248,6 @@ VIT-EV-BUGGY
 - Firebase configuration for the selected application
 
 ### 1. Clone the repository
-
-Replace the placeholders with your actual repository URL and directory name.
 
 ```bash
 git clone <REPOSITORY_URL>
