@@ -144,9 +144,9 @@ Place the photo at `docs/images/vit-ev-buggy.jpg`, or update the image path abov
 
 ### 📍 Faculty App
 
-| Live EV Map | Pickup / Arrival Status |
-|:---:|:---:|
-| ![Faculty Live Map](docs/screenshots/faculty-map.png) | ![Faculty Arrival Status](docs/screenshots/faculty-arrival.png) |
+| Live EV Map | Alternate Faculty Map View | Pickup / Arrival Status |
+|:---:|:---:|:---:|
+| ![Faculty Live Map](docs/screenshots/faculty-map.png) | ![Faculty Map View 2](docs/screenshots/faculty-map-2.png) | ![Faculty Arrival Status](docs/screenshots/faculty-arrival.png) |
 
 ### 🛠️ Admin App
 
@@ -164,6 +164,7 @@ docs/
     ├── driver-start.png
     ├── driver-active.png
     ├── faculty-map.png
+    ├── faculty-map-2.png
     ├── faculty-arrival.png
     ├── admin-dashboard.png
     └── admin-history.png
